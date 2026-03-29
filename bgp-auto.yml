@@ -28,10 +28,9 @@ topology:
       
     switch-wan:
       kind: cisco_iol
-      #mgmt-ipv4: 172.80.80.5
-      image: arthurk99/cisco-iol-l2:17.15.01 
+      image: vrnetlab/cisco_iol:l2-17.12.01 
       type: L2
-      #startup-config: configs/myconfig.txt 
+      
 
     srvweb:
        kind: linux
