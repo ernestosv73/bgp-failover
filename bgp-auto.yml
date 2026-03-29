@@ -10,14 +10,14 @@ topology:
       kind: nokia_srlinux
       #mgmt-ipv4: 172.80.80.5
       image: ghcr.io/nokia/srlinux:24.10.1
-      type: ixrd3
+      type: ixr-d3
       startup-config: configs/rt-prov1.cfg 
 
     rt-provider2:
       kind: nokia_srlinux
       #mgmt-ipv4: 172.80.80.5
       image: ghcr.io/nokia/srlinux:24.10.1
-      type: ixrd3
+      type: ixr-d3
       startup-config: configs/rt-prov2.cfg 
 
     rt-core:
