@@ -29,15 +29,6 @@ This laboratory simulates an Internet Service Provider (ISP) network environment
 
 ## 🔄 Architecture Diagram
 
-```mermaid
-graph LR
-    A[NetBox: SSoT] -->|Webhooks| B(GitLab CI/CD)
-    B -->|Trigger Pipeline| C[GitLab Runner]
-    C -->|Execute via SSH| D[Nornir]
-    D -->|Configure| E[Huawei Core Router]
-    F[Telemetry Stack] -->|Metrics| A
-    F -->|Alerts| B
-```mermaid
 
 ## 📡 Telemetry Stack
 
