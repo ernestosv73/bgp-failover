@@ -1,96 +1,47 @@
-# Containerlab Lab: Automation and Telemetry Applied to BGP Routing Policies
+# Containerlab Lab: Automation & Telemetry for BGP Routing Policies
 
-## 📌 Overview
+## Overview
 
-This lab simulates an Internet Service Provider (ISP) network environment with two WAN links (**Provider1** and **Provider2**). It implements:
-
-- An **Automation Framework** for dynamic BGP routing policy updates  
-- A **Telemetry Stack** for real-time observability of link quality  
-
-The proposed solution enables **automatic BGP policy failover** based on network quality metrics.
+This lab simulates an ISP network environment with two WAN links (`Provider1` and `Provider2`). It deploys an **Automation Framework** for updating BGP routing policies and a **Telemetry Stack** for real-time observability of link quality to the providers. The proposed solution enables automatic failover of BGP routing policies based on network quality metrics.
 
 ---
 
-## 🧩 Solution Architecture
+## Solution Description
 
-### 🔧 Automation Framework
+### Automation Framework
 
-#### NetBox Node
-- Single Source of Truth (SSoT) for network infrastructure  
-- BGP policy modeling using custom fields  
-- RESTful API for integration with external tools  
-- Webhooks to trigger automation events  
+| Component | Description |
+|-----------|-------------|
+| **NetBox Node** | Single Source of Truth for network infrastructure. Models BGP policies using custom fields. Provides RESTful API for external integration and Webhooks to trigger automation events. <br/>*Source: [NetBox Labs](https://netboxlabs.com/)* |
+| **GitLab CI/CD** | Automated pipeline for BGP policy configuration changes. GitLab Runner executes configuration changes. <br/>*Source: [GitLab](https://gitlab.com/)* |
+| **Nornir Node** | Multi-vendor, multi-platform automation task orchestration. GitLab Runner registered here for Huawei core router access. <br/>*Source: [Nornir Docs](https://nornir.readthedocs.io/en/latest/)* |
 
-🔗 Source: https://netboxlabs.com/
+### Telemetry Stack
 
----
-
-#### GitLab CI/CD
-- Automated pipeline for BGP policy changes  
-- GitLab Runner executes configuration changes  
-
-🔗 Source: https://gitlab.com/
+| Component | Description |
+|-----------|-------------|
+| **MTR (Matt's Traceroute)** | Link diagnostics for BGP peers — monitors latency, jitter, and packet loss. Integrated with BGP failover script. <br/>*Source: [MTR on GitHub](https://github.com/traviscross/mtr)* |
+| **Elasticsearch** | Storage and automatic indexing of telemetry events sent by the BGP failover script. <br/>*Source: [Elasticsearch](https://www.elastic.co/elasticsearch)* |
+| **Grafana** | Dynamic visualization of latency metrics to BGP peers and link change tracking. Uses Elasticsearch as datasource. <br/>*Source: [Grafana](https://grafana.com/)* |
 
 ---
 
-#### Nornir Node
-- Multi-vendor, multi-platform automation orchestration  
-- GitLab Runner registered for access to Huawei core router  
+## Lab Architecture
 
-🔗 Source: https://nornir.readthedocs.io/en/latest/
+![Network Topology](./images/topology.png)
 
----
+## BGP Failover Workflow
 
-### 📊 Telemetry Stack
-
-#### MTR (Matt's Traceroute)
-- BGP peer link diagnostics  
-- Monitoring of latency, jitter, and packet loss  
-- Integrated with BGP failover script  
-
-🔗 Source: https://github.com/traviscross/mtr
+![Failover Workflow](./images/workflow.png)
 
 ---
 
-#### Elasticsearch Node
-- Storage and indexing of telemetry events  
-- Data ingestion from BGP failover script  
-
-🔗 Source: https://www.elastic.co/
-
----
-
-#### Grafana
-- Dynamic visualization of latency metrics  
-- Link status monitoring and change tracking  
-- Elasticsearch used as datasource  
-
-🔗 Source: https://grafana.com/
-
----
-
-## 🏗️ Lab Architecture
-
-> 📷 *Insert network topology diagram here*
-
----
-
-## 🔄 BGP Failover Workflow
-
-> 📷 *Insert workflow diagram here*
-
----
-
-## ⚙️ Automation Framework Configuration
+## Automation Framework Configuration
 
 ### 1. NetBox Node
 
-- Install NetBox container:  
-  https://github.com/netbox-community/netbox-docker/wiki/Using-Netbox-Plugins  
-
-- Install BGP plugin:  
-  https://github.com/netbox-community/netbox-bgp.git  
-
-- Deploy NetBox:
-```bash
-docker compose up -d
+- Install the NetBox container following [NetBox Docker Plugin Guide](https://github.com/netbox-community/netbox-docker/wiki/Using-Netbox-Plugins)
+- Install the BGP plugin: [netbox-bpg](https://github.com/netbox-community/netbox-bgp.git)
+- Deploy NetBox node:
+  ```bash
+  docker compose up -d
