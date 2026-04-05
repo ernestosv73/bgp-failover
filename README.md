@@ -37,6 +37,7 @@ graph LR
     D -->|Configure| E[Huawei Core Router]
     F[Telemetry Stack] -->|Metrics| A
     F -->|Alerts| B
+```mermaid
 
 ## 📡 Telemetry Stack
 
