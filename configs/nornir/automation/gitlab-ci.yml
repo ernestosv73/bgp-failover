@@ -1,13 +1,11 @@
 stages:
-  - validate
   - deploy
 
 variables:
-  NETBOX_URL: "http://192.168.117.135:8000"
-  NETBOX_TOKEN: "c889397e6b09cfd1556378047213220b2c47b7e8"
+  NETBOX_URL: "http://192.168.0.140:8000"
+  NETBOX_TOKEN: "rDbitCHC2V3fQy2Ksmr1pRuagb7pCc2qXCYz7qEp"
 
-# === FLUJO 1: DEPLOY AUTOMÁTICO (BGP Failover) ===
-deploy_bgp_auto:
+deploy_to_production_auto:
   stage: deploy
   tags:
     - nornir
@@ -15,46 +13,4 @@ deploy_bgp_auto:
     - echo "🚀 Desplegando cambios BGP automáticamente desde NetBox..."
     - python3 apply_bgp_policies.py
   when: on_success
-  only:
-    variables:
-      - $TRIGGERED_BY_NETBOX
-
-# === FLUJO 2: VALIDACIÓN DE CONFIGURACIÓN COMPLETA ===
-validate_full_config:
-  stage: validate
-  tags:
-    - nornir
-  script:
-    - echo "🧪 Validando configuración completa del router..."
-    - if [ -f "configs/huawei-router.cfg" ]; then
-        python3 scripts/validate_huawei_config.py configs/huawei-router.cfg;
-      else
-        echo "⚠️ No se encontró archivo de configuración";
-        exit 1;
-      fi
-  only:
-    changes:
-      - configs/huawei-router.cfg
-    refs:
-      - master
-  except:
-    variables:
-      - $TRIGGERED_BY_NETBOX
-
-# === FLUJO 3: DEPLOY MANUAL (Configuración completa) ===
-deploy_full_config_manual:
-  stage: deploy
-  tags:
-    - nornir
-  script:
-    - echo "🚀 Aplicando configuración completa del router..."
-    - python3 scripts/apply_huawei_config.py
-  when: manual
-  only:
-    changes:
-      - configs/huawei-router.cfg
-    refs:
-      - master
-  except:
-    variables:
-      - $TRIGGERED_BY_NETBOX
+  # Elimina temporalmente la sección "only"
