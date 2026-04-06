@@ -223,3 +223,6 @@ python3 bgp_failover_telemetry_u.py
 ```bash
 http://<local-server-ip>:3000
 ```  
+## 📄 Licence
+
+This project is licensed under the terms of the [MIT](LICENSE).
