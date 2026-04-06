@@ -155,3 +155,12 @@ gitlab-runner register \
   --tag-list "nornir, production" \
   --executor "shell"
 ```
+## 📡 BGP Failover Script Functionality
+### Monitoring Tool
+- MTR (My Traceroute)
+- Protocol: IPv4 / IPv6
+- Output format: JSON (for automated parsing)
+### 📏 Measurements and Scoring
+- Measurement Points
+  - BGP Peer → Direct latency to router
+  - Public DNS → Hop-by-hop latency
