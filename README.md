@@ -125,4 +125,20 @@ docker compose up -d
 - Connect NetBox to Containerlab topology:
 ```bash
 docker network connect isp-bgp netbox-docker-netbox-1
-```  
+```
+### 2. GitLab CI/CD (Secure Automation Pipeline)
+- Create a GitLab repository
+- Configure .gitlab-ci.yml:
+  - Stages: deploy
+  - Variables: NetBox URL, NetBox Token
+  - Script: apply_bgp_policies.py
+- Configure Nornir inventories:
+  - defaults.yaml
+  - groups.yaml
+  - hosts.yaml
+- Configure nornir-config.yml:
+  - Inventory paths
+  - Connection options
+- Implement Python automation script:
+  - apply_bgp_policies.py
+- Example configuration files available at: /configs/nornir/automation
