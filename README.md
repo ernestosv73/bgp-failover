@@ -108,7 +108,7 @@ docker compose up -d
 ```
 - Generate a secure API token
 - Configure core objects:
--- Sites
+  - Sites
 Platforms
 Manufacturers
 Devices
