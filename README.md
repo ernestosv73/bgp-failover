@@ -91,7 +91,7 @@ sequenceDiagram
     else Metrics OK
         Script->>ES: Log normal operation
     end
-
+```
 ## ⚙️ Automation Framework Configuration (Detailed)
 
 ### 1. NetBox Node
