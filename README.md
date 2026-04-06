@@ -170,3 +170,12 @@ gitlab-runner register \
 | Average Latency | (ms) | 
 | Jitter / Variability | (Standard Deviation) | 
 | Packet Loss | (%) |
+### Measurement Parameters
+| Parameter | value | 
+|-----------|------|
+| Cycle interval | 30 seconds | 
+| Packets per cycle | 5 | 
+| Packet size | 64 bytes |
+| Packet interval | 0.5 seconds |
+| Timeout | 30 seconds |
+
