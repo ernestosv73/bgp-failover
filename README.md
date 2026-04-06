@@ -182,5 +182,15 @@ gitlab-runner register \
 - Score = Weighted_Latency + Loss_Penalty + Jitter_Penalty. Where...
   - Weighted_Latency = (Peer × 70%) + (DNS × 30%)
   - Loss_Penalty = (Peer_Loss% + DNS_Loss%) × 100
-  - Jitter_Penalty = (Peer_StDev + DNS_StDev) × 0.5 
+  - Jitter_Penalty = (Peer_StDev + DNS_StDev) × 0.5
+### 📊 Decision Logic
+- Lower score = Better link quality
+#### Configurable Thresholds
+| Metric | Warning | Critical |
+|-----------|------|----------|
+| Peer Latency | 12 ms | 25 ms |
+| DNS Latency | 20 ms | 50 ms |
+| Packet Loss | 0% | 20% (immediate failover) |
+| Switching Margin | - | 3 points |
+
 
