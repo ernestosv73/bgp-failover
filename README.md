@@ -145,4 +145,13 @@ docker network connect isp-bgp netbox-docker-netbox-1
 - Create Pipeline Trigger Token (for secure pipeline execution via NetBox webhooks)
 - Create Project Runner (required for automation job execution):
   - Tags: nornir, production
-
+### 3. Nornir Node
+- Register GitLab Runner in nornir node:
+```bash
+gitlab-runner register \
+  --url "https://gitlab.com/" \
+  --registration-token "YOUR_PROJECT_RUNNER_TOKEN" \
+  --description "Nornir Production Runner" \
+  --tag-list "nornir, production" \
+  --executor "shell"
+```
