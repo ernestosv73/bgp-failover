@@ -164,3 +164,8 @@ gitlab-runner register \
 - Measurement Points
   - BGP Peer → Direct latency to router
   - Public DNS → Hop-by-hop latency
+ 
+ | Average Latency | (ms) | 
+|-----------|------|
+| Jitter / Variability | (Standard Deviation) | 
+| **GitLab CI/CD** | Configuration Pipeline |
