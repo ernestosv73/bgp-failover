@@ -142,3 +142,7 @@ docker network connect isp-bgp netbox-docker-netbox-1
 - Implement Python automation script:
   - apply_bgp_policies.py
 - Example configuration files available at: /configs/nornir/automation
+- Create Pipeline Trigger Token (for secure pipeline execution via NetBox webhooks)
+- Create Project Runner (required for automation job execution):
+  - Tags: nornir, production
+
