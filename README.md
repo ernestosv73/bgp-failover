@@ -202,4 +202,24 @@ gitlab-runner register \
 #### ⚡ Execution
 - Policy updates via NetBox API (routing policies)
 - Fully automated execution (no manual intervention)
-
+## 🚀 Topology Deployment and Node Access
+### Deploy the lab
+```bash
+clab deploy -t bgp-auto.yml
+```
+### Access Nornir node
+```bash
+docker exec -it clab-lab-isp-automation-nornir /bin/bash
+```
+#### Register GitLab Runner
+- (Execute inside nornir node if not already configured)
+#### Run BGP Failover Script
+```bash
+cd /root/automation
+python3 bgp_failover_telemetry_u.py
+```
+#### Access Grafana Dashboard
+- Open in your browser:
+```bash
+http://<local-server-ip>:3000
+```  
