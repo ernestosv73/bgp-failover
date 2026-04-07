@@ -46,9 +46,7 @@ This laboratory simulates an Internet Service Provider (ISP) network environment
 
 ## 🗺️ Laboratory Architecture
 
-![Network Topology Diagram](./images/topology-diagram.png)
-
-> 📌 *Replace `./images/topology-diagram.png` with the actual path to your topology image. Recommended size: 1200x800px for optimal rendering.*
+![Network Topology Diagram](./images/topologia_bgp_failover.png)
 
 ### 🔍 Architecture Highlights:
 - **Dual WAN Uplinks**: Provider1 & Provider2 with independent BGP sessions
@@ -59,10 +57,6 @@ This laboratory simulates an Internet Service Provider (ISP) network environment
 ---
 
 ## 🔄 BGP Failover Workflow
-
-![BGP Failover Workflow Diagram](./images/bgp-failover-workflow.png)
-
-> 📌 *Replace `./images/bgp-failover-workflow.png` with the actual path to your workflow image.*
 
 ### Workflow Steps:
 1. 📊 **Monitor**: MTR continuously probes BGP peers for latency, jitter, and packet loss
