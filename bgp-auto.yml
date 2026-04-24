@@ -6,6 +6,13 @@ mgmt:
 topology:
   nodes:
 
+    rt-wan:
+      kind: nokia_srlinux
+      #mgmt-ipv4: 172.80.80.5
+      image: ghcr.io/nokia/srlinux:24.10.1
+      type: ixr-d3
+      #startup-config: configs/rt-prov1.cfg 
+      
     rt-provider1:
       kind: nokia_srlinux
       #mgmt-ipv4: 172.80.80.5
@@ -26,10 +33,10 @@ topology:
       image: vrnetlab/huawei_vrp:ne40e-8.180
       #startup-config: configs/myconfig.txt
       
-    switch-wan:
-      kind: cisco_iol
-      image: vrnetlab/cisco_iol:l2-17.12.01 
-      type: L2
+    #switch-wan:
+      #kind: cisco_iol
+      #image: vrnetlab/cisco_iol:l2-17.12.01 
+      #type: L2
       
 
     srvweb:
@@ -122,9 +129,9 @@ topology:
     - endpoints: ["rt-core:eth3", "switch-agr:eth1"]
     - endpoints: ["PC-corpo:eth1", "switch-agr:eth2"]
     - endpoints: ["nornir:eth1", "switch-agr:eth3"] 
-    - endpoints: ["rt-provider1:e1-2", "switch-wan:eth1"]
-    - endpoints: ["rt-provider2:e1-2", "switch-wan:eth2"]
-    - endpoints: ["srvweb:eth1", "switch-wan:eth3"]
+    - endpoints: ["rt-provider1:e1-2", "rt-wan:e1-1"]
+    - endpoints: ["rt-provider2:e1-2", "rt-wan:e1-2"]
+    - endpoints: ["srvweb:eth1", "rt-wan:e1-3"]
     - endpoints: ["rt-provider2:e1-3", "srv-cloudflare:eth1"]
     - endpoints: ["rt-provider1:e1-3", "srv-google:eth1"]
    
