@@ -10,3 +10,5 @@ pip install xgboost scikit-learn
 sleep 1
 pip install matplotlib pandas seaborn
 sleep 1
+pip install optuna
+sleep 1
