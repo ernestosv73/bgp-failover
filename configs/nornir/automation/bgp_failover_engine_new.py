@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-BGP Failover Engine - v2: SCORING NORMALIZADO (RATIO-A-UMBRAL + CAP + SEVERIDAD)
+BGP Failover Engine - v2.1: SCORING NORMALIZADO (RATIO-A-UMBRAL + CAP + SEVERIDAD)
 ✅ LÓGICA DE SCORING (reemplaza el modelo legacy ponderado sin normalizar):
 ├─ Normalización ratio-a-umbral por métrica: metric_norm = min(valor/umbral, cap)
 ├─ Cap = 3.0 (límite de influencia, no de medición)
-├─ base_score = peer_norm*0.27 + dns_norm*0.40 + jitter_norm*0.33  (pesos suman 1)
+├─ base_score = peer_norm*0.27 + dns_norm*0.50 + jitter_norm*0.23  (pesos suman 1)
 ├─ loss_norm agregado sobre ventana de confirmación (3 ciclos = 15 paquetes)
+├─ jitter_norm TAMBIÉN agregado en ventana (3 ciclos) — v2.1: con n=5 paquetes
+│   por ciclo el StDev es muy volátil; un solo pico dominaba el score (visto
+│   en corrida real: ciclo 3 en Containerlab). Windowing + peso reducido
+│   corrige esto.
 ├─ severity_multiplier = 1 + loss_norm  →  score_final = base_score * severity_multiplier
 ├─ Score independiente por DNS1 y DNS2, decisión usa max(score_dns1, score_dns2)
 ├─ umbral_failover = 1.10 | umbral_retorno = 0.80 (constantes universales,
@@ -84,6 +88,7 @@ IMMEDIATE_FAILOVER_LOSS_PCT = 20.0
 CAP = 3.0                    # límite de influencia de cualquier métrica normalizada
 LOSS_SLA_PCT = 1.0            # SLA contractual de pérdida de paquetes
 LOSS_WINDOW_CYCLES = 3        # ventana de confirmación para agregar pérdida (15 paquetes)
+JITTER_WINDOW_CYCLES = 3      # ventana para agregar jitter y amortiguar picos de un solo ciclo (n=5)
 
 # ✅ UMBRALES CRÍTICOS (denominadores de la normalización)
 PEER_THRESHOLDS = {
@@ -106,12 +111,17 @@ JITTER_THRESHOLDS = {
     'critical': 10.0,   # jitterX_norm = min(dnsX_stddev/10, cap)
 }
 
-# ✅ PESOS DE SCORING — reescalados para sumar 1 (preserva proporción 0.4:0.6
-# peer:dns del draft IETF, y agrega jitter dentro de la misma normalización)
+# ✅ PESOS DE SCORING v2.1 — dns_norm aumentado, jitter_norm reducido.
+# Motivo (evidencia empírica, ciclos 3-5 de la corrida en Containerlab):
+# con n=5 paquetes/ciclo, jitter (StDev) es muy volátil — un solo pico puede
+# tocar el cap (3.0) y dominar el score aunque la latencia real (señal más
+# estable) sea la que efectivamente indica degradación sostenida. Bajar el
+# peso de jitter, junto con agregarlo en ventana (ver JITTER_WINDOW_CYCLES),
+# evita que un pico de un solo ciclo domine o "enmascare" la tendencia real.
 SCORING_WEIGHTS = {
     'peer': 0.27,
-    'dns': 0.40,
-    'jitter': 0.33,
+    'dns': 0.50,
+    'jitter': 0.23,
 }
 
 # ✅ UMBRALES DE DECISIÓN — constantes universales porque el score está
@@ -146,6 +156,9 @@ class LatencyMetrics:
     dns2_norm: float = 0.0
     jitter1_norm: float = 0.0
     jitter2_norm: float = 0.0
+
+    jitter1_window_ms: float = 0.0
+    jitter2_window_ms: float = 0.0
 
     loss1_window_pct: float = 0.0
     loss2_window_pct: float = 0.0
@@ -208,28 +221,43 @@ class LatencyMetrics:
     def has_packet_loss(self) -> bool:
         return self.peer_loss > 0.0 or self.dns1_loss > 0.0 or self.dns2_loss > 0.0
 
-    def calculate_scores(self, loss1_window_pct: float, loss2_window_pct: float):
+    def calculate_scores(
+        self,
+        loss1_window_pct: float,
+        loss2_window_pct: float,
+        jitter1_window_ms: float,
+        jitter2_window_ms: float,
+    ):
         """
-        ✅ Fórmula de scoring v2 (ratio-a-umbral + cap + severidad por pérdida).
+        ✅ Fórmula de scoring v2.1 (ratio-a-umbral + cap + severidad por pérdida
+        + jitter agregado en ventana).
 
         1. Normalización:      metric_norm = min(valor / umbral_critico, cap)
-        2. Score base:         base_score = peer_norm*0.27 + dns_norm*0.40 + jitter_norm*0.33
+        2. Score base:         base_score = peer_norm*0.27 + dns_norm*0.50 + jitter_norm*0.23
         3. Severidad:          severity_multiplier = 1 + loss_norm
         4. Score final:        score = base_score * severity_multiplier
 
-        loss1_window_pct / loss2_window_pct deben venir ya agregados sobre la
-        ventana de confirmación (LOSS_WINDOW_CYCLES ciclos) — ver
-        BGPFailoverEngine._compute_loss_windows().
+        loss1/2_window_pct y jitter1/2_window_ms deben venir ya agregados sobre
+        la ventana de confirmación (LOSS_WINDOW_CYCLES / JITTER_WINDOW_CYCLES) —
+        ver BGPFailoverEngine._compute_loss_windows() / _compute_jitter_windows().
+
+        ⚠️ El jitter se agrega en ventana (no crudo de un solo ciclo) porque con
+        n=5 paquetes por MTR, el StDev es muy volátil: un solo paquete con
+        retardo anómalo puede tocar el cap y dominar el score, enmascarando
+        tanto falsos positivos (spike aislado) como falsos negativos (score
+        cae cuando el spike pasa, aunque la latencia siga degradada).
         """
         self.loss1_window_pct = loss1_window_pct
         self.loss2_window_pct = loss2_window_pct
+        self.jitter1_window_ms = jitter1_window_ms
+        self.jitter2_window_ms = jitter2_window_ms
 
         # --- 1. Normalización ratio-a-umbral ---
         self.peer_norm = min(self.peer_avg / PEER_THRESHOLDS['critical'], CAP)
         self.dns1_norm = min(self.dns1_avg / DNS_THRESHOLDS['DNS1']['critical'], CAP)
         self.dns2_norm = min(self.dns2_avg / DNS_THRESHOLDS['DNS2']['critical'], CAP)
-        self.jitter1_norm = min(self.dns1_stddev / JITTER_THRESHOLDS['critical'], CAP)
-        self.jitter2_norm = min(self.dns2_stddev / JITTER_THRESHOLDS['critical'], CAP)
+        self.jitter1_norm = min(jitter1_window_ms / JITTER_THRESHOLDS['critical'], CAP)
+        self.jitter2_norm = min(jitter2_window_ms / JITTER_THRESHOLDS['critical'], CAP)
         self.loss1_norm = min(loss1_window_pct / LOSS_SLA_PCT, CAP)
         self.loss2_norm = min(loss2_window_pct / LOSS_SLA_PCT, CAP)
 
@@ -403,6 +431,15 @@ class BGPFailoverEngine:
                     dns_hop = hop
 
             if not peer_hop:
+                # 🔎 DIAGNÓSTICO: volcar los hops reales para identificar por qué
+                # el peer configurado (peer_ip) nunca aparece en la traza a este
+                # DNS. Útil para descartar ECMP / next-hop distinto / formato de
+                # IP no coincidente. Quitar o bajar a DEBUG una vez diagnosticado.
+                observed_hosts = [hop.get('host') for hop in hubs]
+                logging.warning(
+                    f"🔎 DIAGNÓSTICO: peer_ip esperado='{peer_ip}' NO está en hops de {dns_name}. "
+                    f"Hops observados: {observed_hosts}"
+                )
                 if peer_fallback:
                     logging.info(f"ℹ️ Peer no encontrado en MTR a {dns_name}, usando fallback de DNS1")
                     peer_metrics = peer_fallback
@@ -503,6 +540,17 @@ class BGPFailoverEngine:
         loss2_window_pct = float(np.mean([m.dns2_loss for m in window]))
         return loss1_window_pct, loss2_window_pct
 
+    def _compute_jitter_windows(self) -> Tuple[float, float]:
+        """
+        Promedia dns1_stddev/dns2_stddev de los últimos JITTER_WINDOW_CYCLES
+        ciclos (incluyendo el actual). Amortigua picos de un solo ciclo
+        producidos por el bajo tamaño de muestra de MTR (n=5 paquetes).
+        """
+        window = self.metrics_history[-JITTER_WINDOW_CYCLES:]
+        jitter1_window_ms = float(np.mean([m.dns1_stddev for m in window]))
+        jitter2_window_ms = float(np.mean([m.dns2_stddev for m in window]))
+        return jitter1_window_ms, jitter2_window_ms
+
     def calculate_rolling_stats(self, field_name: str = 'max_score') -> Dict[str, Optional[float]]:
         """Rolling mean/std/p95 sobre un campo numérico del historial
         (default: max_score, usado para rolling_mean/std/p95 en TimescaleDB)."""
@@ -571,7 +619,10 @@ class BGPFailoverEngine:
             self.metrics_history.pop(0)
 
         loss1_window_pct, loss2_window_pct = self._compute_loss_windows()
-        metrics.calculate_scores(loss1_window_pct, loss2_window_pct)
+        jitter1_window_ms, jitter2_window_ms = self._compute_jitter_windows()
+        metrics.calculate_scores(
+            loss1_window_pct, loss2_window_pct, jitter1_window_ms, jitter2_window_ms
+        )
 
         logging.info("📈 Estado actual:")
         logging.info(f"   ⭐ Provider actual: {self.current_primary_provider}")
@@ -662,6 +713,8 @@ class BGPFailoverEngine:
                 'dns2_norm': round(metrics.dns2_norm, 4),
                 'jitter1_norm': round(metrics.jitter1_norm, 4),
                 'jitter2_norm': round(metrics.jitter2_norm, 4),
+                'jitter1_window_ms': round(metrics.jitter1_window_ms, 3),
+                'jitter2_window_ms': round(metrics.jitter2_window_ms, 3),
                 'loss1_window_pct': round(metrics.loss1_window_pct, 3),
                 'loss2_window_pct': round(metrics.loss2_window_pct, 3),
                 'loss1_norm': round(metrics.loss1_norm, 4),
