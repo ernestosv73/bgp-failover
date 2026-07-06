@@ -98,7 +98,7 @@ PEER_THRESHOLDS = {
 
 DNS_DESTINATIONS = {
     'DNS1': '2001:db8:8888::100',
-    'DNS2': '2001:db8:4444::100',
+    'DNS2': '2001:db8:ffad::100',
 }
 
 DNS_THRESHOLDS = {
@@ -220,6 +220,52 @@ class LatencyMetrics:
     @property
     def has_packet_loss(self) -> bool:
         return self.peer_loss > 0.0 or self.dns1_loss > 0.0 or self.dns2_loss > 0.0
+
+    @property
+    def has_individual_critical_breach(self) -> bool:
+        """
+        ✅ v2.2 — Detección de breach individual sostenido.
+
+        El score ponderado (base_score) diluye cualquier señal aislada: si solo
+        UNA métrica está por encima de su umbral crítico y las demás sanas, el
+        score total puede quedar muy por debajo de umbral_failover aunque esa
+        métrica esté claramente en zona crítica (evidencia empírica: DNS1 a
+        34-35ms sostenido, 3 ciclos, con base_score máximo de 0.88 vs umbral
+        1.10 — ver CHANGELOG).
+
+        Esta property es independiente del promedio ponderado: cualquier
+        *_norm >= 1.0 (es decir, la métrica cruda ya superó su propio umbral
+        crítico) cuenta como breach, sin importar el peso que tenga en la
+        fórmula compuesta. Requiere scores_ready=True (llamar después de
+        calculate_scores()).
+        """
+        if not self.scores_ready:
+            return False
+        return (
+            self.peer_norm >= 1.0 or
+            self.dns1_norm >= 1.0 or
+            self.dns2_norm >= 1.0 or
+            self.jitter1_norm >= 1.0 or
+            self.jitter2_norm >= 1.0
+        )
+
+    @property
+    def individual_breach_detail(self) -> str:
+        """Nombra cuál(es) métrica(s) están en breach individual, para logging/DB."""
+        if not self.scores_ready:
+            return ""
+        breaches = []
+        if self.peer_norm >= 1.0:
+            breaches.append(f"peer({self.peer_avg:.1f}ms)")
+        if self.dns1_norm >= 1.0:
+            breaches.append(f"dns1({self.dns1_avg:.1f}ms)")
+        if self.dns2_norm >= 1.0:
+            breaches.append(f"dns2({self.dns2_avg:.1f}ms)")
+        if self.jitter1_norm >= 1.0:
+            breaches.append(f"jitter1({self.jitter1_window_ms:.1f}ms)")
+        if self.jitter2_norm >= 1.0:
+            breaches.append(f"jitter2({self.jitter2_window_ms:.1f}ms)")
+        return ", ".join(breaches)
 
     def calculate_scores(
         self,
@@ -599,11 +645,25 @@ class BGPFailoverEngine:
     def should_switch_provider(self) -> Tuple[str, str, Optional[LatencyMetrics], bool]:
         """
         1. Medir PROVIDER1 (peer + DNS1 + DNS2) → métricas crudas
-        2. Agregar al historial y calcular ventana de pérdida
-        3. Calcular scores normalizados (v2) sobre ese historial
+        2. Agregar al historial y calcular ventana de pérdida/jitter
+        3. Calcular scores normalizados (v2.1) sobre ese historial
         4. Bypass de seguridad: pérdida severa en un ciclo → failover inmediato
-        5. Si estamos en PROVIDER2: evaluar retorno (max_score < umbral_retorno)
+        5. Si estamos en PROVIDER2: evaluar retorno
         6. Si estamos en PROVIDER1: evaluar degradación sostenida (3 ciclos)
+
+        ✅ v2.2 — degradación sostenida ahora dispara por DOS condiciones (OR):
+          (a) max_score > umbral_failover           → degradación CONJUNTA
+              (varias señales moderadamente elevadas a la vez)
+          (b) has_individual_critical_breach         → degradación AISLADA
+              (una sola métrica cruza su propio umbral crítico, aunque el
+              promedio ponderado la diluya). Ver LatencyMetrics.
+              has_individual_critical_breach para el porqué era necesario:
+              un promedio ponderado por diseño no puede "ver" una señal única
+              que se sale de rango si las demás están sanas.
+        El retorno exige la condición inversa de AMBAS: max_score bajo Y
+        ninguna métrica individual siga en breach — evita volver al provider
+        primario mientras una señal puntual sigue crítica aunque el promedio
+        ya luzca aceptable.
 
         Devuelve además un booleano `immediate_trigger` para distinguir en la
         BD el bypass de seguridad de una decisión graduada por score.
@@ -613,7 +673,7 @@ class BGPFailoverEngine:
             logging.error("❌ No se pudieron obtener métricas")
             return self.current_primary_provider, "Error de medición", None, False
 
-        # Historial + ventana de pérdida (debe ir antes de calcular scores)
+        # Historial + ventana de pérdida/jitter (debe ir antes de calcular scores)
         self.metrics_history.append(metrics)
         if len(self.metrics_history) > ROLLING_HISTORY_SIZE:
             self.metrics_history.pop(0)
@@ -633,6 +693,8 @@ class BGPFailoverEngine:
             f"sev {metrics.severity_multiplier_dns2:.2f}) | Max: {metrics.max_score:.3f}"
         )
         logging.info(f"   🎯 Umbral Failover: {UMBRAL_FAILOVER} | Umbral Retorno: {UMBRAL_RETORNO}")
+        if metrics.has_individual_critical_breach:
+            logging.info(f"   ⚠️ Breach individual (métrica aislada sobre su crítico): {metrics.individual_breach_detail}")
 
         # 1️⃣ Bypass de seguridad — pérdida severa en un solo ciclo
         if not metrics.is_healthy:
@@ -644,28 +706,37 @@ class BGPFailoverEngine:
 
         # 2️⃣ En PROVIDER2: evaluar retorno
         if self.current_primary_provider == 'PROVIDER2':
-            if metrics.max_score < UMBRAL_RETORNO:
-                logging.info(f"✅ Retorno a PROVIDER1 (max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO})")
+            can_return = metrics.max_score < UMBRAL_RETORNO and not metrics.has_individual_critical_breach
+            if can_return:
+                logging.info(f"✅ Retorno a PROVIDER1 (max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}, sin breach individual)")
                 self.degradation_counter = 0
                 return 'PROVIDER1', f"Retorno: max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}", metrics, False
-            logging.info(f"⏳ Permanecer en PROVIDER2 (max_score {metrics.max_score:.3f} >= {UMBRAL_RETORNO})")
-            return 'PROVIDER2', "Condiciones no mejoradas", metrics, False
+            reason = "breach individual persiste" if metrics.has_individual_critical_breach else "max_score aún elevado"
+            logging.info(f"⏳ Permanecer en PROVIDER2 ({reason})")
+            return 'PROVIDER2', f"Condiciones no mejoradas ({reason})", metrics, False
 
-        # 3️⃣ En PROVIDER1: evaluar degradación sostenida
-        if metrics.max_score > UMBRAL_FAILOVER:
+        # 3️⃣ En PROVIDER1: evaluar degradación sostenida (conjunta O aislada)
+        joint_degradation = metrics.max_score > UMBRAL_FAILOVER
+        isolated_breach = metrics.has_individual_critical_breach
+
+        if joint_degradation or isolated_breach:
             self.degradation_counter += 1
+            trigger_desc = (
+                f"max_score {metrics.max_score:.3f} > {UMBRAL_FAILOVER}" if joint_degradation
+                else f"breach individual: {metrics.individual_breach_detail}"
+            )
             logging.info(
                 f"⏱️ Degradación sostenida: {self.degradation_counter}/{SUSTAINED_DEGRADATION_CYCLES} ciclos "
-                f"[max_score {metrics.max_score:.3f} > {UMBRAL_FAILOVER}]"
+                f"[{trigger_desc}]"
             )
             if self.degradation_counter >= SUSTAINED_DEGRADATION_CYCLES:
                 logging.info(f"🔄 FAILOVER: {self.current_primary_provider} → PROVIDER2")
                 self.degradation_counter = 0
-                return 'PROVIDER2', f"Degradación sostenida: max_score {metrics.max_score:.3f} > {UMBRAL_FAILOVER}", metrics, False
-            return self.current_primary_provider, f"Degradación en progreso: {self.degradation_counter}/{SUSTAINED_DEGRADATION_CYCLES}", metrics, False
+                return 'PROVIDER2', f"Degradación sostenida: {trigger_desc}", metrics, False
+            return self.current_primary_provider, f"Degradación en progreso ({trigger_desc}): {self.degradation_counter}/{SUSTAINED_DEGRADATION_CYCLES}", metrics, False
 
         if self.degradation_counter > 0:
-            logging.info(f"✅ Score normalizado ({metrics.max_score:.3f} <= {UMBRAL_FAILOVER}), contador reseteado")
+            logging.info(f"✅ Condiciones normalizadas (score {metrics.max_score:.3f} <= {UMBRAL_FAILOVER}, sin breach individual), contador reseteado")
         self.degradation_counter = 0
         return self.current_primary_provider, "Condiciones estables", metrics, False
 
@@ -780,11 +851,11 @@ class BGPFailoverEngine:
 
     def _determine_quality_status(self, metrics: LatencyMetrics) -> str:
         """
-        Bucket de calidad ATADO a los mismos umbrales que usa la decisión de
-        failover (antes usaba umbrales ms independientes del score, lo cual
-        podía mostrar 'excellent' mientras el score ya disparaba failover).
+        Bucket de calidad ATADO a los mismos criterios que usa la decisión de
+        failover (v2.2: incluye breach individual, no solo el score conjunto,
+        para que 'excellent'/'warning' no oculten una métrica aislada crítica).
         """
-        if not metrics.is_healthy or metrics.max_score > UMBRAL_FAILOVER:
+        if not metrics.is_healthy or metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach:
             return "critical"
         if metrics.max_score >= UMBRAL_RETORNO:
             return "warning"
@@ -837,7 +908,7 @@ class BGPFailoverEngine:
             if self.current_primary_provider == 'PROVIDER2' and metrics.max_score < UMBRAL_RETORNO:
                 return "retorno"
             return "failover"
-        if metrics.max_score > UMBRAL_FAILOVER and self.degradation_counter > 0:
+        if (metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach) and self.degradation_counter > 0:
             return "degradacion"
         return "normal"
 
