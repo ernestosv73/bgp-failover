@@ -14,7 +14,9 @@ BGP Failover Engine - v2.1: SCORING NORMALIZADO (RATIO-A-UMBRAL + CAP + SEVERIDA
 ├─ Score independiente por DNS1 y DNS2, decisión usa max(score_dns1, score_dns2)
 ├─ umbral_failover = 1.10 | umbral_retorno = 0.80 (constantes universales,
 │   válidas porque el score está normalizado: 1.0 = justo en el límite crítico)
-├─ 3 ciclos de degradación sostenida (anti-flapping)
+├─ 3 ciclos de degradación sostenida (anti-flapping) — v2.4: el RETORNO ahora
+│   exige la misma confirmación (3 ciclos), antes cambiaba en el primer ciclo
+│   bueno, rompiendo la simetría de la especificación original.
 └─ Bypass de seguridad: pérdida severa en UN solo ciclo → failover inmediato
 
 ✅ MONITOREO:
@@ -75,6 +77,15 @@ TIMESCALEDB_PASSWORD = 'bgp_app_password'
 
 # === PARÁMETROS DE FAILOVER ===
 SUSTAINED_DEGRADATION_CYCLES = 3
+
+# ✅ v2.4 — el retorno ahora exige la misma confirmación sostenida que el
+# failover (simetría explícita en la especificación original de la fórmula:
+# "DURANTE 3 ciclos consecutivos" aplicaba a AMBAS direcciones). Se define
+# como constante separada (no reutiliza SUSTAINED_DEGRADATION_CYCLES
+# directamente) para permitir ventanas asimétricas en el futuro si se decide
+# que el costo de un falso retorno amerita una confirmación más larga/corta
+# que el de un falso failover.
+RETURN_CONFIRMATION_CYCLES = 3
 
 # ⚠️ Bypass de seguridad: pérdida en UN solo ciclo (no ventana) que dispara
 # failover inmediato sin esperar los 3 ciclos de confirmación. Se mantiene el
@@ -347,6 +358,7 @@ class BGPFailoverEngine:
         self.cycle_count = 1
         self.current_primary_provider = 'PROVIDER1'
         self.degradation_counter = 0
+        self.improvement_counter = 0   # ✅ v2.4 — contador simétrico para retorno sostenido
 
         # Inicializar TimescaleDB
         if TIMESCALEDB_ENABLED and TIMESCALEDB_AVAILABLE:
@@ -665,6 +677,14 @@ class BGPFailoverEngine:
         primario mientras una señal puntual sigue crítica aunque el promedio
         ya luzca aceptable.
 
+        ✅ v2.4 — el retorno ahora exige la MISMA confirmación sostenida que el
+        failover (RETURN_CONFIRMATION_CYCLES, default 3 ciclos), en vez de
+        cambiar en el primer ciclo que luzca bien. Usa un contador independiente
+        (self.improvement_counter) para no mezclar el estado de "iba a fallar"
+        con el de "iba a volver" — son máquinas de estado separadas que nunca
+        están activas al mismo tiempo (una corre en PROVIDER1, la otra en
+        PROVIDER2).
+
         ✅ v2.3 — fix de consistencia de datos: self.degradation_counter se
         resetea a 0 en el mismo ciclo en que dispara el failover (para que el
         PRÓXIMO ciclo arranque limpio). Si send_metrics_to_timescaledb() leyera
@@ -713,16 +733,41 @@ class BGPFailoverEngine:
             worst_loss = max(metrics.peer_loss, metrics.dns1_loss, metrics.dns2_loss)
             logging.warning(f"⚠️ Pérdida crítica en un ciclo: {worst_loss:.1f}% — bypass de seguridad")
             self.degradation_counter = 0
+            self.improvement_counter = 0
             new_provider = 'PROVIDER2' if self.current_primary_provider == 'PROVIDER1' else 'PROVIDER1'
             return new_provider, f"Bypass de seguridad: pérdida {worst_loss:.1f}% en un ciclo", metrics, True, 0, False
 
-        # 2️⃣ En PROVIDER2: evaluar retorno
+        # 2️⃣ En PROVIDER2: evaluar retorno sostenido (simétrico al failover, v2.4)
         if self.current_primary_provider == 'PROVIDER2':
-            can_return = metrics.max_score < UMBRAL_RETORNO and not metrics.has_individual_critical_breach
-            if can_return:
-                logging.info(f"✅ Retorno a PROVIDER1 (max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}, sin breach individual)")
-                self.degradation_counter = 0
-                return 'PROVIDER1', f"Retorno: max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}", metrics, False, 0, False
+            can_improve = metrics.max_score < UMBRAL_RETORNO and not metrics.has_individual_critical_breach
+
+            if can_improve:
+                self.improvement_counter += 1
+                # 🔒 Capturar el valor EN ESTE momento (mismo criterio que degradation_cycle_report)
+                improvement_cycle_report = self.improvement_counter
+                logging.info(
+                    f"⏱️ Mejora sostenida: {improvement_cycle_report}/{RETURN_CONFIRMATION_CYCLES} ciclos "
+                    f"[max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}, sin breach individual]"
+                )
+                if improvement_cycle_report >= RETURN_CONFIRMATION_CYCLES:
+                    logging.info(f"✅ RETORNO: {self.current_primary_provider} → PROVIDER1")
+                    self.improvement_counter = 0   # reset para el próximo ciclo, ya reportado arriba
+                    return (
+                        'PROVIDER1',
+                        f"Retorno sostenido: max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO} "
+                        f"({improvement_cycle_report}/{RETURN_CONFIRMATION_CYCLES})",
+                        metrics, False, improvement_cycle_report, True
+                    )
+                return (
+                    'PROVIDER2',
+                    f"Mejora en progreso (max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}): "
+                    f"{improvement_cycle_report}/{RETURN_CONFIRMATION_CYCLES}",
+                    metrics, False, improvement_cycle_report, False
+                )
+
+            if self.improvement_counter > 0:
+                logging.info(f"⚠️ Mejora interrumpida, contador de retorno reseteado")
+            self.improvement_counter = 0
             reason = "breach individual persiste" if metrics.has_individual_critical_breach else "max_score aún elevado"
             logging.info(f"⏳ Permanecer en PROVIDER2 ({reason})")
             return 'PROVIDER2', f"Condiciones no mejoradas ({reason})", metrics, False, 0, False
@@ -836,7 +881,6 @@ class BGPFailoverEngine:
                 'provider_changed': cycle_data['provider_changed'],
                 'provider_change_reason': cycle_data.get('change_reason', ''),
                 'degradation_cycle': cycle_data['degradation_cycle_report'],
-                'sustained_degradation': cycle_data['sustained_report'],
                 'quality_status': self._determine_quality_status(metrics),
                 'decision': cycle_data.get('decision', 'normal'),
                 'immediate_failover_triggered': immediate_trigger,
