@@ -98,7 +98,7 @@ PEER_THRESHOLDS = {
 
 DNS_DESTINATIONS = {
     'DNS1': '2001:db8:8888::100',
-    'DNS2': '2001:db8:ffad::100',
+    'DNS2': '2001:db8:4444::100',
 }
 
 DNS_THRESHOLDS = {
@@ -642,7 +642,7 @@ class BGPFailoverEngine:
     # ------------------------------------------------------------------
     # Lógica de decisión
     # ------------------------------------------------------------------
-    def should_switch_provider(self) -> Tuple[str, str, Optional[LatencyMetrics], bool]:
+    def should_switch_provider(self) -> Tuple[str, str, Optional[LatencyMetrics], bool, int, bool]:
         """
         1. Medir PROVIDER1 (peer + DNS1 + DNS2) → métricas crudas
         2. Agregar al historial y calcular ventana de pérdida/jitter
@@ -665,13 +665,25 @@ class BGPFailoverEngine:
         primario mientras una señal puntual sigue crítica aunque el promedio
         ya luzca aceptable.
 
-        Devuelve además un booleano `immediate_trigger` para distinguir en la
-        BD el bypass de seguridad de una decisión graduada por score.
+        ✅ v2.3 — fix de consistencia de datos: self.degradation_counter se
+        resetea a 0 en el mismo ciclo en que dispara el failover (para que el
+        PRÓXIMO ciclo arranque limpio). Si send_metrics_to_timescaledb() leyera
+        self.degradation_counter directamente, la fila del ciclo que disparó el
+        failover quedaría grabada con degradation_cycle=0 y
+        sustained_degradation=False — perdiendo la evidencia justo en el
+        registro más importante. Por eso esta función devuelve explícitamente
+        `degradation_cycle_report` (el valor del contador EN EL MOMENTO de la
+        decisión, antes de cualquier reset) y `sustained_report`, para que
+        run_cycle() los persista tal cual, en vez de re-leer el estado mutable
+        del engine después de que ya cambió.
+
+        Devuelve: (new_provider, reason, metrics, immediate_trigger,
+                   degradation_cycle_report, sustained_report)
         """
         metrics = self.measure_provider_latency()
         if not metrics:
             logging.error("❌ No se pudieron obtener métricas")
-            return self.current_primary_provider, "Error de medición", None, False
+            return self.current_primary_provider, "Error de medición", None, False, 0, False
 
         # Historial + ventana de pérdida/jitter (debe ir antes de calcular scores)
         self.metrics_history.append(metrics)
@@ -702,7 +714,7 @@ class BGPFailoverEngine:
             logging.warning(f"⚠️ Pérdida crítica en un ciclo: {worst_loss:.1f}% — bypass de seguridad")
             self.degradation_counter = 0
             new_provider = 'PROVIDER2' if self.current_primary_provider == 'PROVIDER1' else 'PROVIDER1'
-            return new_provider, f"Bypass de seguridad: pérdida {worst_loss:.1f}% en un ciclo", metrics, True
+            return new_provider, f"Bypass de seguridad: pérdida {worst_loss:.1f}% en un ciclo", metrics, True, 0, False
 
         # 2️⃣ En PROVIDER2: evaluar retorno
         if self.current_primary_provider == 'PROVIDER2':
@@ -710,10 +722,10 @@ class BGPFailoverEngine:
             if can_return:
                 logging.info(f"✅ Retorno a PROVIDER1 (max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}, sin breach individual)")
                 self.degradation_counter = 0
-                return 'PROVIDER1', f"Retorno: max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}", metrics, False
+                return 'PROVIDER1', f"Retorno: max_score {metrics.max_score:.3f} < {UMBRAL_RETORNO}", metrics, False, 0, False
             reason = "breach individual persiste" if metrics.has_individual_critical_breach else "max_score aún elevado"
             logging.info(f"⏳ Permanecer en PROVIDER2 ({reason})")
-            return 'PROVIDER2', f"Condiciones no mejoradas ({reason})", metrics, False
+            return 'PROVIDER2', f"Condiciones no mejoradas ({reason})", metrics, False, 0, False
 
         # 3️⃣ En PROVIDER1: evaluar degradación sostenida (conjunta O aislada)
         joint_degradation = metrics.max_score > UMBRAL_FAILOVER
@@ -721,24 +733,31 @@ class BGPFailoverEngine:
 
         if joint_degradation or isolated_breach:
             self.degradation_counter += 1
+            # 🔒 Capturar el valor EN ESTE momento — es el que se persiste,
+            # independientemente de si más abajo se resetea para el próximo ciclo.
+            degradation_cycle_report = self.degradation_counter
             trigger_desc = (
                 f"max_score {metrics.max_score:.3f} > {UMBRAL_FAILOVER}" if joint_degradation
                 else f"breach individual: {metrics.individual_breach_detail}"
             )
             logging.info(
-                f"⏱️ Degradación sostenida: {self.degradation_counter}/{SUSTAINED_DEGRADATION_CYCLES} ciclos "
+                f"⏱️ Degradación sostenida: {degradation_cycle_report}/{SUSTAINED_DEGRADATION_CYCLES} ciclos "
                 f"[{trigger_desc}]"
             )
-            if self.degradation_counter >= SUSTAINED_DEGRADATION_CYCLES:
+            if degradation_cycle_report >= SUSTAINED_DEGRADATION_CYCLES:
                 logging.info(f"🔄 FAILOVER: {self.current_primary_provider} → PROVIDER2")
-                self.degradation_counter = 0
-                return 'PROVIDER2', f"Degradación sostenida: {trigger_desc}", metrics, False
-            return self.current_primary_provider, f"Degradación en progreso ({trigger_desc}): {self.degradation_counter}/{SUSTAINED_DEGRADATION_CYCLES}", metrics, False
+                self.degradation_counter = 0   # reset para el próximo ciclo, ya reportado arriba
+                return 'PROVIDER2', f"Degradación sostenida: {trigger_desc}", metrics, False, degradation_cycle_report, True
+            return (
+                self.current_primary_provider,
+                f"Degradación en progreso ({trigger_desc}): {degradation_cycle_report}/{SUSTAINED_DEGRADATION_CYCLES}",
+                metrics, False, degradation_cycle_report, False
+            )
 
         if self.degradation_counter > 0:
             logging.info(f"✅ Condiciones normalizadas (score {metrics.max_score:.3f} <= {UMBRAL_FAILOVER}, sin breach individual), contador reseteado")
         self.degradation_counter = 0
-        return self.current_primary_provider, "Condiciones estables", metrics, False
+        return self.current_primary_provider, "Condiciones estables", metrics, False, 0, False
 
     def switch_to_provider(self, new_provider: str, reason: str):
         if new_provider == self.current_primary_provider:
@@ -816,8 +835,8 @@ class BGPFailoverEngine:
                 'current_provider': cycle_data['current_provider'],
                 'provider_changed': cycle_data['provider_changed'],
                 'provider_change_reason': cycle_data.get('change_reason', ''),
-                'degradation_cycle': self.degradation_counter,
-                'sustained_degradation': self.degradation_counter >= SUSTAINED_DEGRADATION_CYCLES,
+                'degradation_cycle': cycle_data['degradation_cycle_report'],
+                'sustained_degradation': cycle_data['sustained_report'],
                 'quality_status': self._determine_quality_status(metrics),
                 'decision': cycle_data.get('decision', 'normal'),
                 'immediate_failover_triggered': immediate_trigger,
@@ -869,7 +888,10 @@ class BGPFailoverEngine:
             logging.info("=" * 80)
             logging.info(f"🔍 Ciclo #{self.cycle_count} - Primary: {self.current_primary_provider}")
 
-            new_provider, reason, metrics, immediate_trigger = self.should_switch_provider()
+            (
+                new_provider, reason, metrics, immediate_trigger,
+                degradation_cycle_report, sustained_report
+            ) = self.should_switch_provider()
             provider_will_change = new_provider != self.current_primary_provider
 
             cycle_data = {
@@ -879,7 +901,11 @@ class BGPFailoverEngine:
                 "previous_provider": self.current_primary_provider if provider_will_change else None,
                 "new_provider": new_provider if provider_will_change else None,
                 "change_reason": reason,
-                "decision": self._determine_decision(metrics, provider_will_change, immediate_trigger)
+                "degradation_cycle_report": degradation_cycle_report,
+                "sustained_report": sustained_report,
+                "decision": self._determine_decision(
+                    metrics, provider_will_change, immediate_trigger, degradation_cycle_report
+                )
             }
 
             if metrics:
@@ -888,7 +914,6 @@ class BGPFailoverEngine:
             if provider_will_change:
                 self.switch_to_provider(new_provider, reason)
                 logging.info(f"🔄 Failover: {cycle_data['previous_provider']} → {new_provider} (ciclo: {self.cycle_count})")
-                self.degradation_counter = 0
             else:
                 logging.info(f"✓ Sin cambios - {reason}")
 
@@ -898,7 +923,11 @@ class BGPFailoverEngine:
             logging.error(f"❌ Error en ciclo: {e}", exc_info=True)
 
     def _determine_decision(
-        self, metrics: Optional[LatencyMetrics], provider_will_change: bool, immediate_trigger: bool
+        self,
+        metrics: Optional[LatencyMetrics],
+        provider_will_change: bool,
+        immediate_trigger: bool,
+        degradation_cycle_report: int,
     ) -> str:
         if not metrics:
             return "error"
@@ -908,7 +937,7 @@ class BGPFailoverEngine:
             if self.current_primary_provider == 'PROVIDER2' and metrics.max_score < UMBRAL_RETORNO:
                 return "retorno"
             return "failover"
-        if (metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach) and self.degradation_counter > 0:
+        if (metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach) and degradation_cycle_report > 0:
             return "degradacion"
         return "normal"
 
