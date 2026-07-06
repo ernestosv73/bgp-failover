@@ -37,8 +37,9 @@ topology:
        image: docker.io/esanchezv/srvhttps:latest
        binds:
         #- configs/web-server.html:/var/www/localhost/htdocs/index.html
-       #exec:
-         #- ip -6 route del default dev eth0
+       exec:
+        - ip -6 address add 2001:db8:ffad::100/64 dev eth1
+        - ip -6 route add default via 2001:db8:ffad::1
 
     srv-cloudflare:
        kind: linux
