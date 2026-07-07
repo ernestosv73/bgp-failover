@@ -187,11 +187,24 @@ class LatencyMetrics:
 
     scores_ready: bool = False   # evita usar scores antes de calculate_scores()
 
-    @property
-    def is_healthy(self) -> bool:
-        """Bypass de seguridad: pérdida severa en un solo ciclo (sin ventana)."""
+    def is_healthy(self, include_peer: bool = True) -> bool:
+        """
+        Bypass de seguridad: pérdida severa en un solo ciclo (sin ventana).
+
+        ⚠️ v2.6 — include_peer=False SOLO se usa desde el bypass de seguridad
+        cuando el proveedor activo es PROVIDER2. El nodo de monitoreo puede
+        medir el peer de PROVIDER1 sin importar la ruta activa (está en un
+        segmento no afectado por el failover), así que peer_loss SIGUE siendo
+        una señal válida — el problema no es que sea irrelevante, sino que el
+        bypass, al detectar peer_loss alto, saltaría "al otro proveedor": si
+        ya estamos en PROVIDER2, eso significa saltar directo hacia PROVIDER1
+        (el standby) precisamente cuando se acaba de detectar que está roto.
+        dns1_loss/dns2_loss no tienen este problema: viajan por el ruteo BGP
+        vigente y siempre reflejan el path realmente activo.
+        """
+        peer_ok = (self.peer_loss < IMMEDIATE_FAILOVER_LOSS_PCT) if include_peer else True
         return (
-            self.peer_loss < IMMEDIATE_FAILOVER_LOSS_PCT and
+            peer_ok and
             self.dns1_loss < IMMEDIATE_FAILOVER_LOSS_PCT and
             self.dns2_loss < IMMEDIATE_FAILOVER_LOSS_PCT
         )
@@ -232,7 +245,6 @@ class LatencyMetrics:
     def has_packet_loss(self) -> bool:
         return self.peer_loss > 0.0 or self.dns1_loss > 0.0 or self.dns2_loss > 0.0
 
-    @property
     def has_individual_critical_breach(self) -> bool:
         """
         ✅ v2.2 — Detección de breach individual sostenido.
@@ -249,6 +261,12 @@ class LatencyMetrics:
         crítico) cuenta como breach, sin importar el peso que tenga en la
         fórmula compuesta. Requiere scores_ready=True (llamar después de
         calculate_scores()).
+
+        v2.6: peer_norm se incluye SIEMPRE (a diferencia de is_healthy, que sí
+        distingue dirección para el bypass) — el nodo de monitoreo mide el
+        peer de PROVIDER1 sin importar la ruta activa, y esta señal es
+        justamente la que gatea el retorno a PROVIDER1 mientras estamos en
+        PROVIDER2. Ver is_healthy() para la única excepción real (el bypass).
         """
         if not self.scores_ready:
             return False
@@ -260,7 +278,6 @@ class LatencyMetrics:
             self.jitter2_norm >= 1.0
         )
 
-    @property
     def individual_breach_detail(self) -> str:
         """Nombra cuál(es) métrica(s) están en breach individual, para logging/DB."""
         if not self.scores_ready:
@@ -609,48 +626,6 @@ class BGPFailoverEngine:
         jitter2_window_ms = float(np.mean([m.dns2_stddev for m in window]))
         return jitter1_window_ms, jitter2_window_ms
 
-    def calculate_rolling_stats(self, field_name: str = 'max_score') -> Dict[str, Optional[float]]:
-        """Rolling mean/std/p95 sobre un campo numérico del historial
-        (default: max_score, usado para rolling_mean/std/p95 en TimescaleDB)."""
-        values = [
-            getattr(m, field_name) for m in self.metrics_history
-            if getattr(m, field_name, None) is not None
-        ]
-        if len(values) < 3:
-            return {'mean': None, 'std': None, 'p95': None, 'count': len(values)}
-        return {
-            'mean': float(np.mean(values)),
-            'std': float(np.std(values)),
-            'p95': float(np.percentile(values, 95)),
-            'count': len(values)
-        }
-
-    def _compute_peer_zscore(self) -> Tuple[Optional[float], Optional[str]]:
-        """
-        Z-score rolling de peer_avg específicamente (columna z_score_peer).
-        z_score_severity es un bucket categórico derivado, no un número:
-        coherente con el tipo varchar(20) definido en el schema.
-        """
-        peer_values = [m.peer_avg for m in self.metrics_history]
-        if len(peer_values) < 3:
-            return None, None
-
-        mean = float(np.mean(peer_values))
-        std = float(np.std(peer_values))
-        if std == 0:
-            return 0.0, 'normal'
-
-        current = peer_values[-1]
-        z = (current - mean) / std
-        abs_z = abs(z)
-        if abs_z < 1.0:
-            bucket = 'normal'
-        elif abs_z < 2.0:
-            bucket = 'elevated'
-        else:
-            bucket = 'severe'
-        return float(z), bucket
-
     # ------------------------------------------------------------------
     # Lógica de decisión
     # ------------------------------------------------------------------
@@ -716,6 +691,31 @@ class BGPFailoverEngine:
             loss1_window_pct, loss2_window_pct, jitter1_window_ms, jitter2_window_ms
         )
 
+        # ⚠️ v2.6 (corrección de v2.5) — el nodo de monitoreo está en un
+        # segmento no afectado por el failover: puede medir el peer de
+        # PROVIDER1 sin importar cuál sea la ruta activa. Eso significa que
+        # peer SIEMPRE es una señal válida — el problema real no era "medir
+        # un enlace irrelevante", sino que el BYPASS usaba esa señal para
+        # decidir la DIRECCIÓN del switch sin considerar que "peer" es
+        # siempre PROVIDER1 específicamente, nunca "el que esté activo".
+        #
+        # Mientras current_provider==PROVIDER2: si peer(=PROVIDER1, standby)
+        # muestra pérdida severa, el bypass ORIGINAL saltaba de todos modos
+        # "al otro proveedor" — es decir, directo hacia el enlace que
+        # acabamos de detectar roto. Por eso el bypass (y SOLO el bypass)
+        # excluye peer cuando no estamos en PROVIDER1: no tiene sentido huir
+        # hacia el propio standby que está mostrando el problema.
+        #
+        # dns1_loss/dns2_loss NO tienen este problema — viajan por el ruteo
+        # BGP vigente, así que siempre reflejan el path realmente activo,
+        # sea cual sea el proveedor.
+        #
+        # En cambio, para la evaluación de RETORNO (¿ya se puede volver a
+        # PROVIDER1?) y para quality_status/decision (etiquetas informativas),
+        # peer SIGUE siendo relevante y medible siempre — ahí se usa
+        # include_peer=True (default), sin excepción.
+        include_peer_bypass = (self.current_primary_provider == 'PROVIDER1')
+
         logging.info("📈 Estado actual:")
         logging.info(f"   ⭐ Provider actual: {self.current_primary_provider}")
         logging.info(
@@ -725,12 +725,12 @@ class BGPFailoverEngine:
             f"sev {metrics.severity_multiplier_dns2:.2f}) | Max: {metrics.max_score:.3f}"
         )
         logging.info(f"   🎯 Umbral Failover: {UMBRAL_FAILOVER} | Umbral Retorno: {UMBRAL_RETORNO}")
-        if metrics.has_individual_critical_breach:
-            logging.info(f"   ⚠️ Breach individual (métrica aislada sobre su crítico): {metrics.individual_breach_detail}")
+        if metrics.has_individual_critical_breach():
+            logging.info(f"   ⚠️ Breach individual (métrica aislada sobre su crítico): {metrics.individual_breach_detail()}")
 
         # 1️⃣ Bypass de seguridad — pérdida severa en un solo ciclo
-        if not metrics.is_healthy:
-            worst_loss = max(metrics.peer_loss, metrics.dns1_loss, metrics.dns2_loss)
+        if not metrics.is_healthy(include_peer_bypass):
+            worst_loss = max(metrics.dns1_loss, metrics.dns2_loss, metrics.peer_loss if include_peer_bypass else 0.0)
             logging.warning(f"⚠️ Pérdida crítica en un ciclo: {worst_loss:.1f}% — bypass de seguridad")
             self.degradation_counter = 0
             self.improvement_counter = 0
@@ -739,7 +739,10 @@ class BGPFailoverEngine:
 
         # 2️⃣ En PROVIDER2: evaluar retorno sostenido (simétrico al failover, v2.4)
         if self.current_primary_provider == 'PROVIDER2':
-            can_improve = metrics.max_score < UMBRAL_RETORNO and not metrics.has_individual_critical_breach
+            # peer SÍ se incluye acá (include_peer=True, default): es la
+            # señal de salud de PROVIDER1, el candidato a retorno — justo lo
+            # que necesitamos para no volver antes de tiempo.
+            can_improve = metrics.max_score < UMBRAL_RETORNO and not metrics.has_individual_critical_breach()
 
             if can_improve:
                 self.improvement_counter += 1
@@ -768,13 +771,13 @@ class BGPFailoverEngine:
             if self.improvement_counter > 0:
                 logging.info(f"⚠️ Mejora interrumpida, contador de retorno reseteado")
             self.improvement_counter = 0
-            reason = "breach individual persiste" if metrics.has_individual_critical_breach else "max_score aún elevado"
+            reason = "breach individual persiste" if metrics.has_individual_critical_breach() else "max_score aún elevado"
             logging.info(f"⏳ Permanecer en PROVIDER2 ({reason})")
             return 'PROVIDER2', f"Condiciones no mejoradas ({reason})", metrics, False, 0, False
 
         # 3️⃣ En PROVIDER1: evaluar degradación sostenida (conjunta O aislada)
         joint_degradation = metrics.max_score > UMBRAL_FAILOVER
-        isolated_breach = metrics.has_individual_critical_breach
+        isolated_breach = metrics.has_individual_critical_breach()
 
         if joint_degradation or isolated_breach:
             self.degradation_counter += 1
@@ -783,7 +786,7 @@ class BGPFailoverEngine:
             degradation_cycle_report = self.degradation_counter
             trigger_desc = (
                 f"max_score {metrics.max_score:.3f} > {UMBRAL_FAILOVER}" if joint_degradation
-                else f"breach individual: {metrics.individual_breach_detail}"
+                else f"breach individual: {metrics.individual_breach_detail()}"
             )
             logging.info(
                 f"⏱️ Degradación sostenida: {degradation_cycle_report}/{SUSTAINED_DEGRADATION_CYCLES} ciclos "
@@ -820,8 +823,6 @@ class BGPFailoverEngine:
             return
         try:
             timestamp = datetime.now(timezone.utc)
-            rolling = self.calculate_rolling_stats('max_score')
-            z_peer, z_peer_bucket = self._compute_peer_zscore()
 
             metric = {
                 'time': timestamp,
@@ -884,13 +885,6 @@ class BGPFailoverEngine:
                 'quality_status': self._determine_quality_status(metrics),
                 'decision': cycle_data.get('decision', 'normal'),
                 'immediate_failover_triggered': immediate_trigger,
-
-                # Rolling stats / Z-score (poblados desde ahora, insumo para Etapa 2)
-                'rolling_mean': rolling['mean'],
-                'rolling_std': rolling['std'],
-                'rolling_p95': rolling['p95'],
-                'z_score_peer': round(z_peer, 4) if z_peer is not None else None,
-                'z_score_severity': z_peer_bucket,
             }
 
             self.ts_client.insert_bgp_metrics_new(metric)
@@ -917,8 +911,15 @@ class BGPFailoverEngine:
         Bucket de calidad ATADO a los mismos criterios que usa la decisión de
         failover (v2.2: incluye breach individual, no solo el score conjunto,
         para que 'excellent'/'warning' no oculten una métrica aislada crítica).
+
+        v2.6: peer se incluye SIEMPRE acá (include_peer=True, default) — el
+        nodo de monitoreo mide el peer de PROVIDER1 independientemente de la
+        ruta activa, así que es una señal válida en cualquier estado. La única
+        excepción es el bypass de seguridad (should_switch_provider), donde
+        usar peer para decidir la DIRECCIÓN del switch mientras estamos en
+        PROVIDER2 llevaría a saltar hacia el propio standby degradado.
         """
-        if not metrics.is_healthy or metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach:
+        if not metrics.is_healthy() or metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach():
             return "critical"
         if metrics.max_score >= UMBRAL_RETORNO:
             return "warning"
@@ -981,7 +982,7 @@ class BGPFailoverEngine:
             if self.current_primary_provider == 'PROVIDER2' and metrics.max_score < UMBRAL_RETORNO:
                 return "retorno"
             return "failover"
-        if (metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach) and degradation_cycle_report > 0:
+        if (metrics.max_score > UMBRAL_FAILOVER or metrics.has_individual_critical_breach()) and degradation_cycle_report > 0:
             return "degradacion"
         return "normal"
 
