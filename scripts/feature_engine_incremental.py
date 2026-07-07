@@ -1,20 +1,40 @@
 #!/usr/bin/env python3
 """
-Feature Engine Mejorado - Lectura Incremental (SIN REDUNDANCIA)
-Calcula features derivadas SOLO para nuevos datos desde bgp_metrics
-y los almacena en ml_features sin generar duplicados.
-FREQUENCY: Cada minuto (configurable)
-MODO: Incremental (lee último timestamp, procesa SOLO nuevos)
-✅ CORRECCIÓN: Carga features de detección combinada desde bgp_metrics
-✅ NUEVA FÓRMULA DE SCORING: peer×0.4 + dns×0.6 + loss×0.5 + jitter×0.5
-✅ CORRECCIÓN CRÍTICA: Calcula failover_event correctamente
+Feature Engine v2 — Etapa 2: features temporales por métrica desde bgp_metrics_new
+✅ REESCRITO COMPLETO (v1 leía de la tabla legacy `bgp_metrics`, con DNS singular
+   y should_failover/failover_event basados en monitoreo dual-provider — ambos
+   incompatibles con la arquitectura actual del motor v2.4).
+
+LÓGICA:
+├─ Lee de bgp_metrics_new (NO de bgp_metrics). Un registro por ciclo, un solo
+│   provider activo monitoreado — no hay "score del provider alternativo".
+├─ NO recalcula score/quality_index — usa los campos que el motor v2.4 ya
+│   computó correctamente (peer_norm, dns1_norm, ..., max_score, quality_status).
+├─ z-score, CV (σ_ratio), desviación de p95 y derivada del Z se calculan
+│   POR MÉTRICA (peer, dns1, dns2, jitter1, jitter2, loss1, loss2) — un valor
+│   agregado diluiría la señal de una sola métrica degradándose, igual que
+│   diluía el score ponderado antes del fix de "breach individual" (v2.2).
+├─ Tendencia/velocidad/aceleración se calculan para peer/dns1/dns2 (las tres
+│   señales de latencia — las que en la práctica dispararon nuestros
+│   failovers reales).
+├─ Ventana de contexto histórico para rolling stats: TREND_WINDOW_LONG=30
+│   ciclos (~15 min a 30s/ciclo) — distinta de la ventana de 3 ciclos del
+│   motor en vivo (esa está atada a la confirmación de failover/retorno,
+│   no a "testing rápido"; ver documentación en bgp_failover_engine_new.py).
+├─ Target: `target_decision` (multiclase: normal/degradacion/failover/retorno),
+│   derivado directamente de bgp_metrics_new.decision. Filas con
+│   decision IN ('error', 'failover_inmediato') se EXCLUYEN del insert —
+│   no participan del entrenamiento.
+└─ Modo incremental con ventana de contexto: para que las rolling stats de las
+   primeras filas nuevas de cada corrida no arranquen "en frío", se traen
+   también las TREND_WINDOW_LONG-1 filas anteriores al último timestamp
+   procesado, se usan solo como contexto de cálculo, y NO se re-insertan.
 """
 import psycopg2
 import pandas as pd
 import numpy as np
 import logging
-import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # === Configuración ===
 TIMESCALEDB_HOST = 'timescaledb'
@@ -26,27 +46,57 @@ TIMESCALEDB_PASSWORD = 'bgp_app_password'
 # === Configuración de Feature Engine ===
 EXECUTION_MODE = "incremental"
 LAST_HOURS = 1
-BATCH_SIZE = None
 
-# ✅ Constantes del motor BGP
-SUSTAINED_DEGRADATION_CYCLES = 3
-SWITCH_MARGIN = 5
+# ✅ Ventanas de tendencia (Etapa 2) — distintas de la ventana de 3 ciclos del
+# motor en vivo (esa es de CONFIRMACIÓN de decisión; esta es de TENDENCIA para
+# features de entrenamiento). A CYCLE_INTERVAL=30s: 10 ciclos ≈ 5 min,
+# 30 ciclos ≈ 15 min.
+CYCLE_INTERVAL_SECONDS = 30
+TREND_WINDOW_SHORT = 10   # ~5 min
+TREND_WINDOW_LONG = 30    # ~15 min
 
-# ✅ NUEVOS PESOS DE SCORING (alineados con draft IETF)
-SCORING_WEIGHTS = {
-    'peer_latency': 0.4,   # Reducido de 0.7
-    'dns_latency': 0.6,    # Aumentado de 0.3
-    'loss': 0.5,           # Reducido de 10
-    'jitter': 0.5          # Sin cambio
-}
+# ✅ Umbral de spike de pérdida (diferencia entre ciclos consecutivos de la
+# pérdida ya agregada en ventana, dns1_loss_pct/dns2_loss_pct de bgp_metrics_new)
+LOSS_SPIKE_THRESHOLD_PCT = 5.0
 
-# ✅ Umbral máximo de latencia para quality_index
-MAX_LATENCY = 50.0
+# ✅ Decisiones que NO participan del entrenamiento (ver conversación):
+#    'error'             -> falla de medición, no es una observación válida
+#    'failover_inmediato' -> bypass de seguridad (pérdida severa en 1 ciclo),
+#                            mecanismo de disparo distinto al de degradación
+#                            sostenida; mezclarlo confundiría al modelo sobre
+#                            qué patrón temporal antecede a un failover típico.
+EXCLUDED_DECISIONS = ('error', 'failover_inmediato')
+
+# Métricas de latencia con features de tendencia/velocidad/aceleración
+LATENCY_METRICS = [
+    ('peer', 'peer_latency_ms'),
+    ('dns1', 'dns1_latency_ms'),
+    ('dns2', 'dns2_latency_ms'),
+]
+
+# Métricas con z-score (todas las señales normalizables — por métrica, no agregado)
+ZSCORE_METRICS = [
+    ('peer', 'peer_latency_ms'),
+    ('dns1', 'dns1_latency_ms'),
+    ('dns2', 'dns2_latency_ms'),
+    ('jitter1', 'dns1_jitter_ms'),
+    ('jitter2', 'dns2_jitter_ms'),
+    ('loss1', 'dns1_loss_pct'),
+    ('loss2', 'dns2_loss_pct'),
+]
+
+# Métricas con CV (σ_ratio) y desviación de p95 — las tres de latencia,
+# que son las que en la práctica dispararon nuestros failovers reales
+CV_P95_METRICS = [
+    ('peer', 'peer_latency_ms'),
+    ('dns1', 'dns1_latency_ms'),
+    ('dns2', 'dns2_latency_ms'),
+]
 
 
 class TimescaleDBClient:
-    """Cliente mejorado para TimescaleDB con soporte para lectura incremental"""
-    
+    """Cliente para TimescaleDB con soporte de lectura incremental con contexto."""
+
     def __init__(self, host, port, database, user, password):
         self.conn = psycopg2.connect(
             host=host, port=port, database=database, user=user, password=password
@@ -54,370 +104,329 @@ class TimescaleDBClient:
         logging.info(f"✅ Conectado a TimescaleDB en {host}:{port}")
 
     def get_last_feature_timestamp(self):
-        """Lee el último timestamp de ml_features"""
+        """Lee el último timestamp ya procesado en ml_features."""
         try:
             cur = self.conn.cursor()
-            cur.execute("""
-                SELECT COALESCE(MAX(time), NULL)
-                FROM ml_features
-            """)
+            cur.execute("SELECT COALESCE(MAX(time), NULL) FROM ml_features")
             result = cur.fetchone()
             cur.close()
-            
             if result[0]:
                 logging.info(f"✅ Último timestamp en ml_features: {result[0]}")
                 return result[0]
-            else:
-                logging.info("ℹ️ ml_features vacía, procesará últimas horas")
-                return None
+            logging.info("ℹ️ ml_features vacía, procesará últimas horas")
+            return None
         except Exception as e:
             logging.error(f"⚠️ Error leyendo last_timestamp: {e}")
             return None
 
-    def insert_ml_features(self, row):
-        """Inserta un registro de features en ml_features"""
+    def insert_ml_features(self, row: pd.Series) -> bool:
+        """Inserta un registro de features en ml_features."""
         try:
             cur = self.conn.cursor()
-            
-            columns = list(row.index)
+            clean = row.where(pd.notnull(row), None)
+            columns = list(clean.index)
             placeholders = ", ".join(["%s"] * len(columns))
             column_names = ", ".join(columns)
-            
-            query = f"""
-                INSERT INTO ml_features ({column_names})
-                VALUES ({placeholders})
-            """
-            values = [row[col] for col in columns]
-            
+            query = f"INSERT INTO ml_features ({column_names}) VALUES ({placeholders})"
+            values = [clean[col] for col in columns]
             cur.execute(query, values)
             self.conn.commit()
             cur.close()
+            return True
         except Exception as e:
             self.conn.rollback()
             logging.error(f"Error insertando feature: {e}")
+            return False
 
 
-class FeatureEngineImproved:
+class FeatureEngineV2:
     """
-    Feature Engine mejorado con lectura incremental
-    ✅ OBJETIVO: Evitar redundancia, procesar SOLO datos nuevos
-    ✅ CORRECCIÓN: Cargar features de detección combinada desde bgp_metrics
-    ✅ CORRECCIÓN CRÍTICA: Calcular failover_event correctamente
+    Feature Engine v2 — deriva features temporales por métrica desde
+    bgp_metrics_new hacia ml_features, para consumo de Etapa 3 (XGBoost).
     """
-    
+
     def __init__(self):
         self.ts_client = TimescaleDBClient(
-            host=TIMESCALEDB_HOST,
-            port=TIMESCALEDB_PORT,
-            database=TIMESCALEDB_DB,
-            user=TIMESCALEDB_USER,
-            password=TIMESCALEDB_PASSWORD
+            host=TIMESCALEDB_HOST, port=TIMESCALEDB_PORT, database=TIMESCALEDB_DB,
+            user=TIMESCALEDB_USER, password=TIMESCALEDB_PASSWORD
         )
         self.conn = self.ts_client.conn
 
+    # ------------------------------------------------------------------
+    # Carga incremental CON ventana de contexto (fix del cold-start rolling)
+    # ------------------------------------------------------------------
     def load_metrics_incremental(self):
         """
-        ✅ CORRECCIÓN: Carga SOLO nuevos datos desde última ejecución
-        ✅ INCLUYE features de detección combinada desde bgp_metrics
+        Carga los datos nuevos desde bgp_metrics_new, más TREND_WINDOW_LONG-1
+        filas previas como contexto histórico para que las rolling stats de
+        las primeras filas nuevas no arranquen sin ventana. Las filas de
+        contexto se identifican con `is_context=True` y no se insertan.
         """
         last_timestamp = self.ts_client.get_last_feature_timestamp()
-        
+
         if last_timestamp is None:
             time_filter = f"NOW() - INTERVAL '{LAST_HOURS} hours'"
             logging.info(f"📥 Primera ejecución: cargando últimas {LAST_HOURS} horas...")
         else:
             time_filter = f"'{last_timestamp}'::timestamptz"
-            logging.info(f"📥 Cargando SOLO datos después de: {last_timestamp}")
-        
-        # ✅ Query incluye columnas de detección combinada
+            logging.info(f"📥 Cargando datos después de: {last_timestamp}")
+
         query = f"""
             SELECT
-                time, provider,
-                peer_latency_ms, dns_latency_ms,
-                peer_loss_pct, dns_loss_pct,
-                peer_jitter_ms, dns_jitter_ms,
-                score,
-                -- ✅ Features de detección combinada desde bgp_metrics
-                COALESCE(z_score_peer, 0) as z_score_peer,
-                COALESCE(z_score_severity, 'normal') as z_score_severity,
-                COALESCE(rolling_mean, 0) as rolling_mean,
-                COALESCE(rolling_std, 0) as rolling_std,
-                COALESCE(rolling_p95, 0) as rolling_p95,
-                COALESCE(absolute_severity, 'normal') as absolute_severity,
-                COALESCE(relative_diff_ms, 0) as relative_diff_ms,
-                COALESCE(relative_severity, 'normal') as relative_severity,
-                COALESCE(combined_severity, 'normal') as combined_severity,
-                COALESCE(is_combined_anomaly, FALSE) as is_combined_anomaly,
-                -- Degradation tracking
-                COALESCE(degradation_cycle, 0) as degradation_cycle,
-                COALESCE(provider_changed, FALSE) as provider_changed
-            FROM bgp_metrics
+                time, cycle_number, current_provider AS provider,
+                peer_latency_ms, peer_jitter_ms, peer_loss_pct,
+                dns1_latency_ms, dns1_jitter_ms, dns1_loss_pct,
+                dns2_latency_ms, dns2_jitter_ms, dns2_loss_pct,
+                peer_norm, dns1_norm, dns2_norm, jitter1_norm, jitter2_norm,
+                loss1_norm, loss2_norm,
+                base_score_dns1, base_score_dns2,
+                severity_multiplier_dns1, severity_multiplier_dns2,
+                score_dns1, score_dns2, max_score,
+                quality_status, degradation_cycle, provider_changed, decision
+            FROM bgp_metrics_new
             WHERE time > {time_filter}
-            ORDER BY time, provider
+            ORDER BY time
         """
-        
         try:
-            df = pd.read_sql(query, self.conn)
-            
-            if df.empty:
-                logging.info("ℹ️ No hay nuevos datos desde última ejecución")
-                return pd.DataFrame()
-            
-            logging.info(f"✅ Cargados {len(df)} NUEVOS registros (sin redundancia)")
-            
-            # ✅ Verificar que las features de detección combinada se cargaron
-            detection_cols = ['z_score_peer', 'rolling_mean', 'combined_severity']
-            for col in detection_cols:
-                if col in df.columns:
-                    non_zero = (df[col] != 0).sum() if df[col].dtype != 'object' else (df[col] != 'normal').sum()
-                    logging.info(f"   ✓ {col}: {non_zero}/{len(df)} registros con valores calculados")
-                else:
-                    logging.warning(f"   ✗ {col}: NO ENCONTRADO")
-            
-            return df
+            df_new = pd.read_sql(query, self.conn)
+            # ✅ Fix: con conexión psycopg2 "cruda" (no SQLAlchemy), pd.read_sql
+            # no vectoriza columnas timestamp — quedan dtype=object con
+            # datetime.datetime sueltos, y .dt falla más adelante. Se fuerza
+            # la conversión explícita apenas se lee.
+            df_new['time'] = pd.to_datetime(df_new['time'], utc=True)
         except Exception as e:
-            logging.error(f"Error cargando métricas: {e}")
+            logging.error(f"Error cargando métricas nuevas: {e}")
             return pd.DataFrame()
 
-    def calculate_derived_features(self, df):
+        if df_new.empty:
+            logging.info("ℹ️ No hay nuevos datos desde última ejecución")
+            return df_new
+
+        df_new['is_context'] = False
+        logging.info(f"✅ Cargados {len(df_new)} registros nuevos")
+
+        # ✅ Ventana de contexto: últimas TREND_WINDOW_LONG-1 filas ANTES del
+        # primer registro nuevo, para que rolling/z-score/CV no arranquen en frío.
+        context_needed = TREND_WINDOW_LONG - 1
+        if context_needed > 0:
+            first_new_time = df_new['time'].min()
+            context_query = f"""
+                SELECT
+                    time, cycle_number, current_provider AS provider,
+                    peer_latency_ms, peer_jitter_ms, peer_loss_pct,
+                    dns1_latency_ms, dns1_jitter_ms, dns1_loss_pct,
+                    dns2_latency_ms, dns2_jitter_ms, dns2_loss_pct,
+                    peer_norm, dns1_norm, dns2_norm, jitter1_norm, jitter2_norm,
+                    loss1_norm, loss2_norm,
+                    base_score_dns1, base_score_dns2,
+                    severity_multiplier_dns1, severity_multiplier_dns2,
+                    score_dns1, score_dns2, max_score,
+                    quality_status, degradation_cycle, provider_changed, decision
+                FROM bgp_metrics_new
+                WHERE time < '{first_new_time}'::timestamptz
+                ORDER BY time DESC
+                LIMIT {context_needed}
+            """
+            try:
+                df_context = pd.read_sql(context_query, self.conn)
+                df_context['time'] = pd.to_datetime(df_context['time'], utc=True)
+                df_context['is_context'] = True
+                logging.info(f"📎 Contexto histórico agregado: {len(df_context)} filas previas (no se insertan)")
+            except Exception as e:
+                logging.warning(f"⚠️ No se pudo cargar contexto histórico: {e}")
+                df_context = pd.DataFrame()
+        else:
+            df_context = pd.DataFrame()
+
+        df = pd.concat([df_context, df_new], ignore_index=True).sort_values('time').reset_index(drop=True)
+        return df
+
+    # ------------------------------------------------------------------
+    # Etapa 2 — features por métrica: z-score, CV, desviación p95, derivada Z
+    # ------------------------------------------------------------------
+    def calculate_zscore_features(self, df):
         """
-        ✅ ACTUALIZADO: Calcula features derivadas con nueva fórmula de scoring
-        
-        quality_index = 100 - (
-            (weighted_latency / MAX_LATENCY × 40) +
-            (total_loss_pct × 50) +
-            (peer_jitter_ms / 10 × 10)
-        )
-        
-        Justificación de MAX_LATENCY = 50.0:
-        - 2× el umbral crítico más alto (25ms peer, 30ms dns)
-        - Proporciona margen para degradaciones severas sin saturar
-        - Permite que quality_index sea 0 cuando latencia es catastrófica
-        - Compatible con SLAs de ISPs Tier-1 (< 50ms)
+        z-score POR MÉTRICA (rolling, ventana TREND_WINDOW_LONG). Un z-score
+        agregado diluiría la señal de una sola métrica degradándose — misma
+        razón por la que en v2.2 el score ponderado no bastaba y hubo que
+        agregar la detección de breach individual.
         """
         if df.empty:
             return df
-        
-        logging.info("🔧 Calculando features derivadas...")
-        df = df.copy()
-        
-        df['latency_ratio'] = df['peer_latency_ms'] / (df['dns_latency_ms'] + 0.001)
-        df['total_loss_pct'] = (df['peer_loss_pct'] + df['dns_loss_pct']) / 2
-        
-        # ✅ ACTUALIZADO: Usar MAX_LATENCY = 50.0 con nuevos pesos
-        df['quality_index'] = np.clip(
-            100 - (
-                ((df['peer_latency_ms'] * SCORING_WEIGHTS['peer_latency'] + 
-                  df['dns_latency_ms'] * SCORING_WEIGHTS['dns_latency']) / MAX_LATENCY * 40) +
-                (df['total_loss_pct'] * 50) +
-                (df['peer_jitter_ms'] / 10 * 10)
-            ),
-            0, 100
-        )
-        
+        logging.info("🔧 Calculando z-score por métrica...")
+        df = df.sort_values('time').copy()
+
+        for name, col in ZSCORE_METRICS:
+            roll_mean = df[col].rolling(window=TREND_WINDOW_LONG, min_periods=3).mean()
+            roll_std = df[col].rolling(window=TREND_WINDOW_LONG, min_periods=3).std(ddof=0)
+            z = (df[col] - roll_mean) / roll_std.replace(0, np.nan)
+            df[f'z_score_{name}'] = z
+
+            # Derivada del Z (Etapa 2): aceleración de la degradación —
+            # sube más rápido en degradación progresiva que en fluctuación normal
+            if name in ('peer', 'dns1', 'dns2'):
+                df[f'z_deriv_{name}'] = df[f'z_score_{name}'].diff()
+
         return df
 
-    def calculate_temporal_features(self, df):
-        """Calcula features temporales"""
-        if df.empty:
-            return df
-        
-        logging.info("🔧 Calculando features temporales...")
-        df = df.copy()
-        
-        for provider in df['provider'].unique():
-            mask = df['provider'] == provider
-            provider_data = df.loc[mask].sort_values('time')
-            
-            df.loc[mask, 'latency_trend_5min'] = provider_data['peer_latency_ms'].rolling(
-                window=10, min_periods=1
-            ).mean().diff().fillna(0).values
-            
-            df.loc[mask, 'latency_trend_15min'] = provider_data['peer_latency_ms'].rolling(
-                window=30, min_periods=1
-            ).mean().diff().fillna(0).values
-            
-            df.loc[mask, 'latency_velocity'] = provider_data['peer_latency_ms'].diff().fillna(0).values
-            df.loc[mask, 'latency_acceleration'] = provider_data['peer_latency_ms'].diff().diff().fillna(0).values
-            
-            df.loc[mask, 'loss_spike_detected'] = (
-                provider_data['peer_loss_pct'].diff().fillna(0) > 5.0
-            ).astype(bool).values
-        
-        return df
-
-    def calculate_rolling_statistics(self, df):
+    def calculate_cv_p95_features(self, df):
         """
-        ✅ CORRECCIÓN: NO calcular columnas redundantes
-        Las rolling stats (rolling_mean, rolling_std, rolling_p95) ya vienen de bgp_metrics
+        CV (σ_ratio, %) y desviación del p95 respecto a la media móvil,
+        por métrica de latencia (peer/dns1/dns2).
         """
         if df.empty:
             return df
-        
-        logging.info("🔧 Calculando rolling statistics adicionales...")
-        df = df.copy()
-        
-        # ✅ Las columnas rolling_mean, rolling_std, rolling_p95 YA VIENEN de bgp_metrics
-        # NO calcular peer_latency_mean_10, peer_latency_std_10, etc.
-        
+        logging.info("🔧 Calculando CV (σ_ratio) y desviación de p95...")
+        df = df.sort_values('time').copy()
+
+        for name, col in CV_P95_METRICS:
+            roll_mean = df[col].rolling(window=TREND_WINDOW_LONG, min_periods=3).mean()
+            roll_std = df[col].rolling(window=TREND_WINDOW_LONG, min_periods=3).std(ddof=0)
+            roll_p95 = df[col].rolling(window=TREND_WINDOW_LONG, min_periods=3).quantile(0.95)
+
+            df[f'cv_{name}'] = (roll_std / roll_mean.replace(0, np.nan)) * 100
+            # Desviación relativa del valor actual respecto al p95 móvil:
+            # >0 significa que el valor actual ya superó el p95 histórico reciente
+            df[f'p95_dev_{name}'] = (df[col] - roll_p95) / roll_p95.replace(0, np.nan)
+
         return df
 
+    def calculate_trend_features(self, df):
+        """
+        Tendencia (5min/15min), velocidad y aceleración — por métrica de
+        latencia (peer/dns1/dns2). A CYCLE_INTERVAL=30s: ventana de
+        TREND_WINDOW_SHORT=10 ciclos ≈ 5 min, TREND_WINDOW_LONG=30 ≈ 15 min.
+        """
+        if df.empty:
+            return df
+        logging.info("🔧 Calculando tendencia/velocidad/aceleración por métrica...")
+        df = df.sort_values('time').copy()
+
+        for name, col in LATENCY_METRICS:
+            df[f'latency_trend_5min_{name}'] = (
+                df[col].rolling(window=TREND_WINDOW_SHORT, min_periods=1).mean().diff()
+            )
+            df[f'latency_trend_15min_{name}'] = (
+                df[col].rolling(window=TREND_WINDOW_LONG, min_periods=1).mean().diff()
+            )
+            df[f'latency_velocity_{name}'] = df[col].diff()
+            df[f'latency_acceleration_{name}'] = df[col].diff().diff()
+
+        # Spikes de pérdida (ya viene agregada en ventana desde bgp_metrics_new,
+        # así que un salto ciclo-a-ciclo acá es una segunda derivada de la señal)
+        df['loss_spike_dns1'] = (df['dns1_loss_pct'].diff().fillna(0) > LOSS_SPIKE_THRESHOLD_PCT)
+        df['loss_spike_dns2'] = (df['dns2_loss_pct'].diff().fillna(0) > LOSS_SPIKE_THRESHOLD_PCT)
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Features contextuales (sin cambios de fondo respecto a v1)
+    # ------------------------------------------------------------------
     def calculate_contextual_features(self, df):
-        """Calcula features contextuales"""
         if df.empty:
             return df
-        
         logging.info("🔧 Calculando features contextuales...")
         df = df.copy()
-        
         df['hour_of_day'] = df['time'].dt.hour
         df['day_of_week'] = df['time'].dt.dayofweek
-        
         df['is_business_hours'] = (
-            (df['hour_of_day'] >= 9) & (df['hour_of_day'] < 17) &
-            (df['day_of_week'] < 5)
+            (df['hour_of_day'] >= 9) & (df['hour_of_day'] < 17) & (df['day_of_week'] < 5)
         ).astype(bool)
-        
         df['is_peak_traffic'] = (
             ((df['hour_of_day'] >= 10) & (df['hour_of_day'] < 14)) |
             ((df['hour_of_day'] >= 15) & (df['hour_of_day'] < 18))
         ).astype(bool)
-        
         df['is_weekend'] = (df['day_of_week'] >= 5).astype(bool)
-        
         return df
 
-    def calculate_provider_features(self, df):
-        """Calcula features relacionadas con providers"""
+    def calculate_provider_change_context(self, df):
+        """
+        Contexto de cambios de provider desde bgp_failover_events. A diferencia
+        de v1, NO se intenta reconstruir 'alternative_provider_score' — no es
+        derivable porque el motor solo mide el provider activo, no ambos en
+        paralelo.
+        """
         if df.empty:
             return df
-        
-        logging.info("🔧 Calculando provider features...")
+        logging.info("🔧 Calculando contexto de cambios de provider...")
         df = df.copy()
-        
         try:
             cur = self.conn.cursor()
-            
-            cur.execute("""
-                SELECT COUNT(*) FROM bgp_failover_events
-                WHERE time >= NOW() - INTERVAL '1 hour'
-            """)
+            cur.execute("SELECT COUNT(*) FROM bgp_failover_events WHERE time >= NOW() - INTERVAL '1 hour'")
             changes_last_hour = cur.fetchone()[0]
-            
-            cur.execute("""
-                SELECT COALESCE(MAX(time), NOW()) FROM bgp_failover_events
-            """)
+            cur.execute("SELECT COALESCE(MAX(time), NOW()) FROM bgp_failover_events")
             last_change_time = cur.fetchone()[0]
-            
             cur.close()
-            
             time_since_change = (df['time'] - last_change_time).dt.total_seconds() / 60
         except Exception as e:
             logging.warning(f"⚠️ Error obteniendo failover info: {e}")
             changes_last_hour = 0
-            time_since_change = 0
-        
+            time_since_change = pd.Series(0, index=df.index)
+
         df['provider_changes_last_hour'] = changes_last_hour
         df['time_since_last_change_min'] = time_since_change.clip(lower=0)
-        
-        score_table = df[['time', 'provider', 'score']].copy()
-        
-        score_pivot = score_table.pivot_table(
-            index='time',
-            columns='provider',
-            values='score',
-            aggfunc='first'
-        )
-        
-        df['current_provider_score'] = df['score']
-        
-        df = df.merge(score_pivot.reset_index(), on='time', how='left')
-        
-        providers = df['provider'].unique()
-        if len(providers) == 2:
-            provider1, provider2 = sorted(providers)
-            df['alternative_provider_score'] = df.apply(
-                lambda row: row[provider2] if row['provider'] == provider1 else row[provider1],
-                axis=1
-            )
-        else:
-            df['alternative_provider_score'] = df['score']
-        
-        for col in providers:
-            if col in df.columns and col != 'provider':
-                df = df.drop(columns=[col])
-        
-        df['score_difference'] = df['current_provider_score'] - df['alternative_provider_score']
-        df['margin_exceeds_threshold'] = (df['score_difference'] > SWITCH_MARGIN).astype(bool)
-        
         return df
 
-    def calculate_target_variable(self, df):
+    # ------------------------------------------------------------------
+    # Target multiclase — reemplaza should_failover/failover_event
+    # ------------------------------------------------------------------
+    def calculate_target(self, df):
         """
-        ✅ CORRECCIÓN CRÍTICA: Calcula AMBOS targets
-        - should_failover: 2 registros por failover (uno por provider)
-        - failover_event: 1 registro por failover (solo el provider que PERDIÓ)
+        target_decision viene directamente de bgp_metrics_new.decision
+        (normal / degradacion / failover / retorno). Las filas con
+        decision IN EXCLUDED_DECISIONS se descartan del dataset de
+        entrenamiento (no se insertan en ml_features).
         """
         if df.empty:
             return df
-        
-        logging.info("🔧 Calculando target variable (usando provider_changed como ground truth)...")
         df = df.copy()
-        
-        # Target original (por registro) - 2 registros por failover
-        df['should_failover'] = df['provider_changed'].astype(int)
-        
-        # ✅ CORRECCIÓN CRÍTICA: Target por evento único
-        # Solo marcar el registro del provider que PERDIÓ
-        # (provider_changed=True Y current_provider_score > alternative_provider_score)
-        df['failover_event'] = (
-            (df['provider_changed'] == True) & 
-            (df['current_provider_score'] > df['alternative_provider_score'])
-        ).astype(int)
-        
-        # Estadísticas
-        total_records = len(df)
-        failover_records = df['should_failover'].sum()
-        failover_events = df['failover_event'].sum()
-        unique_failover_times = df[df['failover_event'] == 1]['time'].nunique()
-        
-        logging.info(f"✅ Target calculado:")
-        logging.info(f"   - Total registros en dataset: {total_records}")
-        logging.info(f"   - Registros con should_failover=1: {failover_records} (2 por cada failover)")
-        logging.info(f"   - Registros con failover_event=1: {failover_events} (1 por cada failover)")
-        logging.info(f"   - Failovers ÚNICOS (ciclos distintos): {unique_failover_times}")
-        
+        df['target_decision'] = df['decision']
         return df
 
+    # ------------------------------------------------------------------
+    # Orquestación
+    # ------------------------------------------------------------------
     def process_and_store(self):
-        """Procesa nuevos features y los almacena"""
         df = self.load_metrics_incremental()
-        
         if df.empty:
             logging.info("ℹ️ Sin nuevos datos, nada que procesar")
             return 0
-        
-        logging.info("🔄 Procesando features...")
-        df = self.calculate_derived_features(df)
-        df = self.calculate_temporal_features(df)
-        df = self.calculate_rolling_statistics(df)
+
+        logging.info("🔄 Procesando features (con contexto histórico para rolling stats)...")
+        df = self.calculate_zscore_features(df)
+        df = self.calculate_cv_p95_features(df)
+        df = self.calculate_trend_features(df)
         df = self.calculate_contextual_features(df)
-        df = self.calculate_provider_features(df)
-        df = self.calculate_target_variable(df)  # ✅ Ahora calcula failover_event
-        
-        logging.info("✓ Validando datos...")
-        
+        df = self.calculate_provider_change_context(df)
+        df = self.calculate_target(df)
+
+        # Solo se insertan las filas NUEVAS (is_context=False).
+        # Las de contexto cumplieron su función (dar historia a las rolling
+        # stats) y se descartan aquí.
+        df_to_insert = df[~df['is_context']].copy()
+
+        # ✅ Exclusión explícita: 'error' y 'failover_inmediato' no participan
+        # del entrenamiento (decisión confirmada en la conversación).
+        before = len(df_to_insert)
+        df_to_insert = df_to_insert[~df_to_insert['decision'].isin(EXCLUDED_DECISIONS)]
+        excluded = before - len(df_to_insert)
+        if excluded > 0:
+            logging.info(f"🚫 Excluidas {excluded} filas con decision en {EXCLUDED_DECISIONS}")
+
+        if df_to_insert.empty:
+            logging.info("ℹ️ Nada para insertar tras filtrar contexto/exclusiones")
+            return 0
+
+        # Columnas auxiliares que no van a la tabla
+        df_to_insert = df_to_insert.drop(columns=['is_context', 'decision'])
+
         logging.info("💾 Guardando en ml_features...")
         inserted = 0
-        
-        for idx, row in df.iterrows():
-            try:
-                self.ts_client.insert_ml_features(row)
+        for _, row in df_to_insert.iterrows():
+            if self.ts_client.insert_ml_features(row):
                 inserted += 1
-            except Exception as e:
-                logging.warning(f"Error insertando fila {idx}: {e}")
-        
-        logging.info(f"✅ {inserted} NUEVOS registros grabados (sin redundancia)")
+
+        logging.info(f"✅ {inserted} registros nuevos grabados en ml_features")
         return inserted
 
 
@@ -425,34 +434,24 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('/var/log/feature_engine.log')
-        ]
+        handlers=[logging.StreamHandler(), logging.FileHandler('/var/log/feature_engine.log')]
     )
-    
     logging.info("=" * 80)
-    logging.info("🔧 Feature Engine: Calculando features derivadas (INCREMENTAL)")
+    logging.info("🔧 Feature Engine v2 — Etapa 2 (features temporales por métrica)")
     logging.info("=" * 80)
-    
-    engine = FeatureEngineImproved()
-    
+
+    engine = FeatureEngineV2()
     logging.info(f"⚙️ Modo: {EXECUTION_MODE.upper()}")
-    logging.info(f"⚙️ Fallback: {LAST_HOURS} horas si ml_features vacía")
-    logging.info(f"⚙️ SUSTAINED_DEGRADATION_CYCLES: {SUSTAINED_DEGRADATION_CYCLES}")
-    logging.info(f"⚙️ SWITCH_MARGIN: {SWITCH_MARGIN}")
-    logging.info(f"⚙️ Scoring Weights: {SCORING_WEIGHTS}")
-    logging.info(f"⚙️ MAX_LATENCY: {MAX_LATENCY} ms")
-    logging.info(f"⚙️ ✅ Features de detección combinada: CARGADAS desde bgp_metrics")
-    logging.info(f"⚙️ ✅ CORRECCIÓN: failover_event calculado correctamente")
-    
+    logging.info(f"⚙️ Ventana corta (tendencia): {TREND_WINDOW_SHORT} ciclos (~5 min)")
+    logging.info(f"⚙️ Ventana larga (z-score/CV/p95/tendencia): {TREND_WINDOW_LONG} ciclos (~15 min)")
+    logging.info(f"⚙️ Decisiones excluidas del entrenamiento: {EXCLUDED_DECISIONS}")
+
     inserted = engine.process_and_store()
-    
+
     logging.info("")
     logging.info("=" * 80)
-    logging.info("✅ Feature Engine ejecutado exitosamente")
+    logging.info(f"✅ Feature Engine v2 ejecutado — {inserted} registros nuevos")
     logging.info("=" * 80)
-    logging.info(f"Registros grabados: {inserted} (NUEVOS, sin redundancia)")
 
 
 if __name__ == '__main__':
