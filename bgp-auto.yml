@@ -95,24 +95,24 @@ topology:
        #- ip -6 address add 2001:db8:ca01::100/64 dev eth1 
        #- ip -6 route add default via 2001:db8:ca01::1   
 
-    grafana:
-      kind: linux
-      mgmt-ipv4: 172.90.90.43
-      image: grafana/grafana:12.0.2
-      binds:
+    #grafana:
+      #kind: linux
+      #mgmt-ipv4: 172.90.90.43
+      #image: grafana/grafana:12.0.2
+      #binds:
         
-        - configs/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yaml
-        - configs/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yaml
-        - configs/grafana/dashboards:/var/lib/grafana/dashboards
-      ports:
-        - 3000:3000
-      env:
-        GF_ORG_ROLE: "Admin"
-        GF_ORG_NAME: "Main Org"
-        GF_AUTH_ANONYMOUS_ENABLED: "true"
-        GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-        GF_AUTH_ANONYMOUS: "true"
-        GF_AUTH_OAUTH_AUTO_LOGIN: "true"
+        #- configs/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yaml
+        #- configs/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yaml
+        #- configs/grafana/dashboards:/var/lib/grafana/dashboards
+      #ports:
+        #- 3000:3000
+      #env:
+        #GF_ORG_ROLE: "Admin"
+        #GF_ORG_NAME: "Main Org"
+        #GF_AUTH_ANONYMOUS_ENABLED: "true"
+        #GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+        #GF_AUTH_ANONYMOUS: "true"
+        #GF_AUTH_OAUTH_AUTO_LOGIN: "true"
         
      
     elastic:
