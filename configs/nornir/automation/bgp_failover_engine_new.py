@@ -109,7 +109,7 @@ PEER_THRESHOLDS = {
 
 DNS_DESTINATIONS = {
     'DNS1': '2001:db8:8888::100',
-    'DNS2': '2001:db8:4444::100',
+    'DNS2': '2001:db8:ffad::100',
 }
 
 DNS_THRESHOLDS = {
