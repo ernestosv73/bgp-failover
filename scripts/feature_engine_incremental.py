@@ -18,7 +18,7 @@ LÓGICA:
 │   señales de latencia — las que en la práctica dispararon nuestros
 │   failovers reales).
 ├─ Ventana de contexto histórico para rolling stats: TREND_WINDOW_LONG=30
-│   ciclos (~15 min a 30s/ciclo) — distinta de la ventana de 3 ciclos del
+│   ciclos — distinta de la ventana de 3 ciclos del
 │   motor en vivo (esa está atada a la confirmación de failover/retorno,
 │   no a "testing rápido"; ver documentación en bgp_failover_engine_new.py).
 ├─ Target: `target_decision` (multiclase: normal/degradacion/failover/retorno),
@@ -49,11 +49,20 @@ LAST_HOURS = 1
 
 # ✅ Ventanas de tendencia (Etapa 2) — distintas de la ventana de 3 ciclos del
 # motor en vivo (esa es de CONFIRMACIÓN de decisión; esta es de TENDENCIA para
-# features de entrenamiento). A CYCLE_INTERVAL=30s: 10 ciclos ≈ 5 min,
-# 30 ciclos ≈ 15 min.
-CYCLE_INTERVAL_SECONDS = 30
-TREND_WINDOW_SHORT = 10   # ~5 min
-TREND_WINDOW_LONG = 30    # ~15 min
+# features de entrenamiento).
+#
+# ⚠️ Corrección: el intervalo REAL entre ciclos NO es CYCLE_INTERVAL (30s) —
+# ese valor es solo el sleep() entre mediciones; cada ciclo también tarda
+# ~15s en ejecutar las dos corridas de MTR (DNS1+DNS2). Medido empíricamente
+# sobre una corrida real: intervalo real = 44.9s ± 0.06s, no 30s.
+# Por eso estas ventanas se describen en CANTIDAD DE CICLOS, no en minutos —
+# una estimación en minutos asumiendo 30s/ciclo subestimaría el horizonte
+# real en ~50%. El cálculo en sí (rolling sobre N filas) es correcto
+# independientemente de esto; es solo la etiqueta en minutos la que era
+# engañosa.
+CYCLE_INTERVAL_SECONDS = 30       # sleep() configurado en el motor (referencia, NO el gap real)
+TREND_WINDOW_SHORT = 10   # ~10 ciclos (empíricamente ~7.5 min, no 5 min)
+TREND_WINDOW_LONG = 30    # ~30 ciclos (empíricamente ~22.5 min, no 15 min)
 
 # ✅ Umbral de spike de pérdida (diferencia entre ciclos consecutivos de la
 # pérdida ya agregada en ventana, dns1_loss_pct/dns2_loss_pct de bgp_metrics_new)
@@ -345,26 +354,61 @@ class FeatureEngineV2:
         de v1, NO se intenta reconstruir 'alternative_provider_score' — no es
         derivable porque el motor solo mide el provider activo, no ambos en
         paralelo.
+
+        ⚠️ v2.1 — fix de fuga temporal (data leakage). La versión anterior
+        calculaba 'provider_changes_last_hour' con NOW() y 'time_since_last_
+        change_min' con MAX(time) GLOBAL de bgp_failover_events — un único
+        valor aplicado a TODAS las filas del batch, sin importar el timestamp
+        de cada una. Como el batch corre DESPUÉS de que ya ocurrieron los
+        eventos, cada fila terminaba "viendo" eventos futuros respecto a su
+        propio ciclo (evidencia: filas anteriores al primer failover ya
+        mostraban provider_changes_last_hour=2). Ahora ambas features se
+        calculan POR FILA, usando solo eventos con time < row.time.
         """
         if df.empty:
             return df
-        logging.info("🔧 Calculando contexto de cambios de provider...")
+        logging.info("🔧 Calculando contexto de cambios de provider (por fila, sin fuga temporal)...")
         df = df.copy()
+
         try:
             cur = self.conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM bgp_failover_events WHERE time >= NOW() - INTERVAL '1 hour'")
-            changes_last_hour = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(MAX(time), NOW()) FROM bgp_failover_events")
-            last_change_time = cur.fetchone()[0]
+            cur.execute("SELECT time FROM bgp_failover_events ORDER BY time")
+            event_times = pd.to_datetime(pd.Series([r[0] for r in cur.fetchall()]), utc=True)
             cur.close()
-            time_since_change = (df['time'] - last_change_time).dt.total_seconds() / 60
         except Exception as e:
-            logging.warning(f"⚠️ Error obteniendo failover info: {e}")
-            changes_last_hour = 0
-            time_since_change = pd.Series(0, index=df.index)
+            logging.warning(f"⚠️ Error obteniendo failover_events: {e}")
+            event_times = pd.Series([], dtype='datetime64[ns, UTC]')
 
-        df['provider_changes_last_hour'] = changes_last_hour
-        df['time_since_last_change_min'] = time_since_change.clip(lower=0)
+        if event_times.empty:
+            df['provider_changes_last_hour'] = 0
+            df['time_since_last_change_min'] = np.nan
+            return df
+
+        event_times_np = event_times.values.astype('datetime64[ns]')
+
+        def _row_context(row_time):
+            row_time_np = np.datetime64(row_time.tz_convert('UTC').tz_localize(None))
+            window_start = row_time_np - np.timedelta64(1, 'h')
+            # Eventos estrictamente anteriores a esta fila (evita ver el propio
+            # evento del ciclo actual como "pasado")
+            prior_mask = event_times_np < row_time_np
+            prior_events = event_times_np[prior_mask]
+
+            changes_last_hour = int(((prior_events >= window_start)).sum())
+            if len(prior_events) == 0:
+                time_since_min = np.nan   # sin evento previo -> NULL, no 0
+            else:
+                last_change = prior_events.max()
+                time_since_min = (row_time_np - last_change) / np.timedelta64(1, 'm')
+
+            return pd.Series({
+                'provider_changes_last_hour': changes_last_hour,
+                'time_since_last_change_min': time_since_min,
+            })
+
+        context = df['time'].apply(_row_context)
+        df['provider_changes_last_hour'] = context['provider_changes_last_hour'].astype(int)
+        df['time_since_last_change_min'] = context['time_since_last_change_min']
         return df
 
     # ------------------------------------------------------------------
@@ -442,8 +486,8 @@ def main():
 
     engine = FeatureEngineV2()
     logging.info(f"⚙️ Modo: {EXECUTION_MODE.upper()}")
-    logging.info(f"⚙️ Ventana corta (tendencia): {TREND_WINDOW_SHORT} ciclos (~5 min)")
-    logging.info(f"⚙️ Ventana larga (z-score/CV/p95/tendencia): {TREND_WINDOW_LONG} ciclos (~15 min)")
+    logging.info(f"⚙️ Ventana corta (tendencia): {TREND_WINDOW_SHORT} ciclos")
+    logging.info(f"⚙️ Ventana larga (z-score/CV/p95/tendencia): {TREND_WINDOW_LONG} ciclos")
     logging.info(f"⚙️ Decisiones excluidas del entrenamiento: {EXCLUDED_DECISIONS}")
 
     inserted = engine.process_and_store()
