@@ -1,663 +1,732 @@
 #!/usr/bin/env python3
 """
-xgboost_optimizer.py - VERSIÓN CON CROSS-VALIDATION
-✅ CORRECCIONES APLICADAS:
-├─ Eliminada feature 'degradation_cycle' (data leakage)
-├─ Implementado Stratified K-Fold Cross-Validation (5 folds)
-├─ Aumentada regularización (max_depth=3, reg_alpha, reg_lambda)
-├─ Análisis de estabilidad de features entre folds
-├─ Pesos promediados entre folds (más robustos)
-└─ NUEVO: Usa failover_event como target (conteo correcto de failovers)
+xgboost_optimizer.py — v3: MULTICLASE sobre ml_features real (Opción A)
+═══════════════════════════════════════════════════════════════════════════════
+✅ REESCRITO COMPLETO respecto a la versión anterior (binaria, tabla legacy):
 
-Objetivo: Encontrar pesos ÓPTIMOS y ESTABLES basado en datos históricos
+CAMBIO DE FONDO — binario → multiclase:
+├─ objective: 'binary:logistic' → 'multi:softprob' (num_class=4)
+├─ target: should_failover/failover_event → target_decision
+│   (normal / degradacion / failover / retorno — Opción A: un solo modelo)
+├─ scale_pos_weight (solo válido para 2 clases) → sample_weight balanceado
+│   por clase (sklearn.utils.class_weight.compute_sample_weight)
+├─ Métricas: precision/recall/f1 → promediado MACRO (no penalizar clases
+│   minoritarias); ROC-AUC → One-vs-Rest promediado (ver slide 6 actualizada)
+└─ eval_metric nativo XGBoost: ['mlogloss', 'merror'] en vez de
+   ['error','aucpr','auc','logloss'] (aucpr/auc binarios no aplican acá)
+
+CAMBIO DE FONDO — features desde ml_features real (no la tabla legacy):
+├─ Elimina TODAS las columnas ya dropeadas en la migración v2 de ml_features
+│   (latency_ratio, quality_index, score_difference, margin_exceeds_threshold,
+│   absolute_severity, relative_diff_ms, relative_severity, combined_severity,
+│   is_combined_anomaly, rolling_mean/std/p95, z_score_severity — no existen)
+├─ Incorpora el set real: DNS1/DNS2 separados, componentes normalizados
+│   Etapa 1, features temporales/estadísticas Etapa 2 (z-score, CV, p95_dev,
+│   z_deriv, trend/velocity/aceleración por métrica), contextuales, y
+│   contexto de cambios de provider (ya sin fuga temporal, ver v2.1 del
+│   feature_engine)
+└─ ⚠️ EXCLUYE explícitamente 'degradation_cycle' y 'provider_changed':
+    - degradation_cycle es el contador que la propia regla del motor usa
+      para decidir failover — incluirlo sería dejar que el modelo aprenda
+      a leer el bookkeeping de la regla existente, no las métricas de red.
+    - provider_changed es casi un espejo binario del target (True
+      exactamente cuando target_decision es 'failover' o 'retorno') — esto
+      NO estaba excluido en la versión anterior y es una fuga real.
+   'quality_status' y 'max_score'/'score_dns1'/'score_dns2' SÍ se incluyen:
+   son medidas (aunque derivadas) del estado de la red en ese ciclo, no
+   contadores del proceso de decisión — es justo lo que queremos que el
+   modelo evalúe (¿el score compuesto actual explica bien la decisión, o
+   las métricas individuales explican más?).
+
+SE CONSERVA (metodología válida, independiente del binario/multiclase):
+  - _to_dmatrix() con sample_weight              (adaptado a multiclase)
+  - find_optimal_rounds() vía xgb.cv()           (adaptado a mlogloss)
+  - analyze_learning_curve()                     (adaptado a mlogloss/merror)
+  - tune_hyperparameters() vía Optuna (BO)       (adaptado a mlogloss)
+  - analyze_feature_stability()                  (sin cambios de fondo)
+
+⚠️ NOTA DE ALCANCE (dataset chico): con ~15-20 filas por corrida de prueba,
+el tuning bayesiano de 7 hiperparámetros puede sobreajustar su propia
+búsqueda. n_trials tiene un default conservador (15, no 30) y todo el
+pipeline degrada con gracia (reduce folds, avisa) en vez de fallar. Escalar
+n_trials cuando el dataset crezca (ver pendiente: captura de más días /
+generador de escenarios sintéticos).
+
+FLUJO RECOMENDADO:
+  optimizer = ScoringWeightOptimizer()
+  best_params = optimizer.tune_hyperparameters(df, n_trials=15)
+  optimizer.train_with_cv(df, best_params=best_params)
+  weights = optimizer.get_optimized_weights()
+═══════════════════════════════════════════════════════════════════════════════
 """
+
 import xgboost as xgb
+import optuna
 import pandas as pd
 import numpy as np
 import logging
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_auc_score, roc_curve
+    precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix,
 )
-import matplotlib.pyplot as plt
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ✅ Clases del target multiclase (Opción A) — orden fijo para reproducibilidad
+DECISION_CLASSES = ['normal', 'degradacion', 'failover', 'retorno']
+
+# ✅ Features EXCLUIDAS explícitamente por fuga de datos (ver docstring arriba)
+LEAKAGE_FEATURES = {'degradation_cycle', 'provider_changed'}
+
+# ✅ Identificadores / no-features (no aportan patrón generalizable)
+IDENTIFIER_COLUMNS = {'time', 'cycle_number', 'target_decision', 'decision'}
+
+# ✅ Columnas categóricas que requieren encoding antes de entrenar
+CATEGORICAL_FEATURES = {
+    'provider': {'PROVIDER1': 0, 'PROVIDER2': 1},
+    'quality_status': {'excellent': 0, 'warning': 1, 'critical': 2},
+}
+
+# ✅ Columnas booleanas que XGBoost necesita como int
+BOOLEAN_FEATURES = ['is_business_hours', 'is_peak_traffic', 'is_weekend', 'loss_spike_dns1', 'loss_spike_dns2']
+
+# ✅ Taxonomía de features (ver slide "Taxonomía de features derivadas") —
+# usada en get_optimized_weights() para agrupar importancia por familia.
+FEATURE_GROUPS = {
+    'peer': [
+        'peer_latency_ms', 'peer_jitter_ms', 'peer_loss_pct', 'peer_norm',
+        'z_score_peer', 'cv_peer', 'p95_dev_peer', 'z_deriv_peer',
+        'latency_trend_5min_peer', 'latency_trend_15min_peer',
+        'latency_velocity_peer', 'latency_acceleration_peer',
+    ],
+    'dns': [
+        'dns1_latency_ms', 'dns1_jitter_ms', 'dns1_loss_pct',
+        'dns2_latency_ms', 'dns2_jitter_ms', 'dns2_loss_pct',
+        'dns1_norm', 'dns2_norm',
+        'z_score_dns1', 'z_score_dns2', 'cv_dns1', 'cv_dns2',
+        'p95_dev_dns1', 'p95_dev_dns2', 'z_deriv_dns1', 'z_deriv_dns2',
+        'latency_trend_5min_dns1', 'latency_trend_5min_dns2',
+        'latency_trend_15min_dns1', 'latency_trend_15min_dns2',
+        'latency_velocity_dns1', 'latency_velocity_dns2',
+        'latency_acceleration_dns1', 'latency_acceleration_dns2',
+    ],
+    'jitter': ['jitter1_norm', 'jitter2_norm', 'z_score_jitter1', 'z_score_jitter2'],
+    'loss': ['loss1_norm', 'loss2_norm', 'z_score_loss1', 'z_score_loss2',
+             'loss_spike_dns1', 'loss_spike_dns2',
+             'severity_multiplier_dns1', 'severity_multiplier_dns2'],
+    'score_compuesto': ['base_score_dns1', 'base_score_dns2', 'score_dns1',
+                         'score_dns2', 'max_score', 'quality_status'],
+    'contextual': ['hour_of_day', 'day_of_week', 'is_business_hours',
+                   'is_peak_traffic', 'is_weekend'],
+    'contexto_cambios': ['provider_changes_last_hour', 'time_since_last_change_min'],
+    'provider': ['provider'],
+}
+
 
 class ScoringWeightOptimizer:
     """
-    Usa XGBoost con Cross-Validation para aprender pesos óptimos de scoring.
-    ✅ CORRECCIÓN: Eliminado data leakage de degradation_cycle
-    ✅ NUEVO: Cross-validation para pesos más estables
-    ✅ NUEVO: Usa failover_event como target (conteo correcto)
+    XGBoost multiclase + Cross-Validation para analizar qué features de
+    ml_features explican mejor target_decision (normal/degradacion/
+    failover/retorno), como insumo para re-calibrar la fórmula de scoring
+    (Opción B: este ranking + Logistic Regression para coeficientes).
     """
-    
+
     def __init__(self):
         self.model = None
         self.feature_importance = None
         self.feature_importance_std = None
-        self.X_test = None
-        self.y_test = None
-        self.y_pred = None
-        self.y_pred_proba = None
         self.features_used = None
         self.cv_scores = None
         self.cv_importances = None
-        self.target_column = None  # ✅ NUEVO: Guardar qué target se usó
-    
+        self.target_column = 'target_decision'
+        self.label_encoder = LabelEncoder().fit(DECISION_CLASSES)
+        self.num_class = len(DECISION_CLASSES)
+
+        self.optimal_rounds = None
+        self.learning_curve_data = None
+        self.best_params = None
+        self.tuning_study = None
+
+    # ════════════════════════════════════════════════════════════════════
+    # DMatrix con sample_weight balanceado por clase (reemplaza scale_pos_weight)
+    # ════════════════════════════════════════════════════════════════════
+    def _to_dmatrix(self, X, y_encoded):
+        X_vals = X.values if hasattr(X, 'values') else np.array(X)
+        sample_weights = compute_sample_weight(class_weight='balanced', y=y_encoded)
+        return xgb.DMatrix(
+            X_vals,
+            label=y_encoded,
+            weight=sample_weights,
+            feature_names=list(X.columns) if hasattr(X, 'columns') else None
+        )
+
+    # ════════════════════════════════════════════════════════════════════
+    # Búsqueda de rondas óptimas vía xgb.cv() nativo (multiclase)
+    # ════════════════════════════════════════════════════════════════════
+    def find_optimal_rounds(self, X, y_encoded, params, max_rounds=500,
+                             early_stop=15, n_folds=5, random_state=42):
+        logger.info(f"\n🔍 Buscando rondas óptimas (max={max_rounds}, early_stop={early_stop})...")
+
+        dtrain = self._to_dmatrix(X, y_encoded)
+        params_with_metrics = {
+            **params,
+            'objective': 'multi:softprob',
+            'num_class': self.num_class,
+            'eval_metric': ['mlogloss', 'merror'],
+        }
+
+        n_folds_safe = min(n_folds, min(np.bincount(y_encoded)))
+        if n_folds_safe < n_folds:
+            logger.warning(f"⚠️ Clase minoritaria tiene <{n_folds} muestras → n_folds={n_folds_safe}")
+        n_folds_safe = max(2, n_folds_safe)
+
+        cv_results = xgb.cv(
+            params=params_with_metrics,
+            dtrain=dtrain,
+            num_boost_round=max_rounds,
+            nfold=n_folds_safe,
+            stratified=True,
+            early_stopping_rounds=early_stop,
+            verbose_eval=False,
+            seed=random_state,
+        )
+
+        optimal_rounds = len(cv_results)
+        opt_idx = cv_results['test-mlogloss-mean'].idxmin()
+
+        self.learning_curve_data = cv_results
+        self.optimal_rounds = optimal_rounds
+
+        logger.info(f"   ✅ Rondas óptimas: {optimal_rounds}")
+        logger.info(f"   ✅ test-mlogloss:  {cv_results['test-mlogloss-mean'].iloc[opt_idx]:.6f} "
+                    f"± {cv_results['test-mlogloss-std'].iloc[opt_idx]:.6f}")
+        if 'test-merror-mean' in cv_results.columns:
+            logger.info(f"   ✅ test-merror:    {cv_results['test-merror-mean'].iloc[opt_idx]:.6f}")
+
+        return optimal_rounds, cv_results
+
+    # ════════════════════════════════════════════════════════════════════
+    # Curva de aprendizaje (multiclase: mlogloss/merror en vez de logloss/auc)
+    # ════════════════════════════════════════════════════════════════════
+    def analyze_learning_curve(self, cv_results=None):
+        if cv_results is None:
+            cv_results = self.learning_curve_data
+        if cv_results is None:
+            logger.error("❌ Ejecutar find_optimal_rounds() primero")
+            return {}
+
+        train_ll = cv_results['train-mlogloss-mean']
+        test_ll = cv_results['test-mlogloss-mean']
+        gap = test_ll - train_ll
+
+        opt_idx = test_ll.idxmin()
+        best_round = int(opt_idx) + 1
+
+        gap_delta = gap.diff().rolling(5).mean()
+        overfit_candidates = gap_delta[gap_delta > 0.0001].index
+        overfit_round = int(overfit_candidates[0]) + 1 if len(overfit_candidates) else None
+
+        summary = {
+            'best_round': best_round,
+            'overfit_start_round': overfit_round,
+            'test_mlogloss_at_best': float(test_ll.iloc[opt_idx]),
+            'test_mlogloss_std': float(cv_results['test-mlogloss-std'].iloc[opt_idx]),
+            'gap_train_test': float(gap.iloc[opt_idx]),
+            'total_rounds': len(cv_results),
+        }
+        if 'test-merror-mean' in cv_results.columns:
+            summary['test_merror_at_best'] = float(cv_results['test-merror-mean'].iloc[opt_idx])
+
+        logger.info(f"\n📈 Learning Curve Analysis:")
+        logger.info(f"   Ronda óptima (min test-mlogloss): {best_round}")
+        logger.info(f"   Inicio overfitting detectado:     {overfit_round or 'no detectado'}")
+        logger.info(f"   Gap train/test en ronda óptima:   {summary['gap_train_test']:.6f}")
+
+        return summary
+
+    # ════════════════════════════════════════════════════════════════════
+    # Bayesian Optimization (Optuna) — adaptado a multiclase
+    # ════════════════════════════════════════════════════════════════════
+    def tune_hyperparameters(self, df, n_trials=15, random_state=42):
+        logger.info("\n" + "═" * 80)
+        logger.info(f"🔍 Hyperparameter Tuning — Bayesian Optimization (Optuna, n_trials={n_trials})")
+        logger.info("═" * 80)
+
+        X, y_encoded, _ = self.prepare_features(df)
+        dtrain = self._to_dmatrix(X, y_encoded)
+        n_folds_safe = max(2, min(5, min(np.bincount(y_encoded))))
+
+        trial_results = []
+
+        def objective(trial):
+            params = {
+                'objective': 'multi:softprob',
+                'num_class': self.num_class,
+                'max_depth': trial.suggest_int('max_depth', 2, 5),
+                'eta': trial.suggest_float('eta', 0.01, 0.30, log=True),
+                'subsample': trial.suggest_float('subsample', 0.60, 1.00),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.60, 1.00),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 5.0),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 5),
+                'eval_metric': ['mlogloss', 'merror'],
+            }
+
+            cv = xgb.cv(
+                params=params,
+                dtrain=dtrain,
+                num_boost_round=300,
+                nfold=n_folds_safe,
+                stratified=True,
+                early_stopping_rounds=15,
+                verbose_eval=False,
+                seed=random_state,
+            )
+
+            best_mlogloss = float(cv['test-mlogloss-mean'].min())
+            trial.set_user_attr('n_estimators', len(cv))
+            trial_results.append({'trial': trial.number + 1, 'mlogloss': best_mlogloss})
+
+            if len(trial_results) % 5 == 0:
+                best_so_far = min(r['mlogloss'] for r in trial_results)
+                logger.info(f"   Trial {len(trial_results):>3}/{n_trials} | "
+                            f"mlogloss={best_mlogloss:.6f} | best_so_far={best_so_far:.6f}")
+
+            return best_mlogloss
+
+        study = optuna.create_study(
+            direction='minimize',
+            sampler=optuna.samplers.TPESampler(seed=random_state)
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+        best_trial = study.best_trial
+        best_params = best_trial.params.copy()
+        best_params['n_estimators'] = best_trial.user_attrs.get('n_estimators', 100)
+
+        logger.info(f"\n   ✅ Optimización completada en {n_trials} trials")
+        logger.info(f"   Best test-mlogloss: {best_trial.value:.6f}")
+        logger.info(f"   Parámetros óptimos:")
+        for p, val in best_trial.params.items():
+            fmt_val = f'{val:.4f}' if isinstance(val, float) else str(val)
+            logger.info(f"     {p:<22} {fmt_val}")
+        logger.info(f"     {'n_estimators':<22} {best_params['n_estimators']}")
+
+        self.best_params = best_params
+        self.tuning_study = study
+        return best_params
+
+    # ════════════════════════════════════════════════════════════════════
+    # prepare_features — REESCRITO para el schema real de ml_features
+    # ════════════════════════════════════════════════════════════════════
     def prepare_features(self, df):
         """
-        ✅ CORREGIDO: Prepara features SIN degradation_cycle (data leakage)
-        ✅ NUEVO: Usa failover_event como target si existe
+        Prepara X (features) e y (target_decision codificado) desde un
+        DataFrame de ml_features real.
+
+        Excluye explícitamente LEAKAGE_FEATURES (degradation_cycle,
+        provider_changed) e IDENTIFIER_COLUMNS (time, cycle_number).
+        Codifica 'provider' y 'quality_status' (categóricas) y castea
+        booleanas a int.
         """
-        logger.info("\n🔧 Preparando features...")
-        
-        # === CATEGORÍA 1: Métricas Base ===
-        base_features = [
-            'peer_latency_ms',
-            'dns_latency_ms',
-            'peer_loss_pct',
-            'dns_loss_pct',
-            'peer_jitter_ms',
-            'dns_jitter_ms',
-        ]
-        
-        # === CATEGORÍA 2: Features Derivadas ===
-        derived_features = [
-            'latency_ratio',
-            'total_loss_pct',
-            'quality_index',
-        ]
-        
-        # === CATEGORÍA 3: Rolling Statistics ===
-        rolling_features = [
-            'rolling_mean',
-            'rolling_std',
-            'rolling_p95',
-        ]
-        
-        # === CATEGORÍA 4: Features de Degradación ===
-        degradation_features = [
-            'score_difference',
-            'margin_exceeds_threshold',
-        ]
-        
-        # === CATEGORÍA 5: Contexto Temporal ===
-        temporal_features = [
-            'hour_of_day',
-            'is_peak_traffic',
-            'is_weekend'
-        ]
-        
-        # === CATEGORÍA 6: Detección Combinada ===
-        combined_detection_features = [
-            'z_score_peer',
-            'z_score_severity',
-            'absolute_severity',
-            'relative_diff_ms',
-            'relative_severity',
-            'combined_severity',
-            'is_combined_anomaly',
-        ]
-        
-        # ✅ Combinar todas las categorías
-        all_features = (
-            base_features + 
-            derived_features + 
-            rolling_features + 
-            degradation_features + 
-            temporal_features +
-            combined_detection_features
-        )
-        
-        # ✅ Validar que las features existan
-        available_features = []
-        missing_features = []
-        
-        for feature in all_features:
-            if feature in df.columns:
-                available_features.append(feature)
-            else:
-                missing_features.append(feature)
-        
-        if missing_features:
-            logger.warning(f"⚠️ Faltan {len(missing_features)} features: {missing_features}")
-        
-        if not available_features:
-            raise ValueError("❌ No hay features disponibles en el dataframe")
-        
-        # ✅ Preparar X
-        X = df[available_features].copy()
-        
-        # ✅ NUEVO: Usar failover_event como target si existe
-        if 'failover_event' in df.columns:
-            y = df['failover_event'].copy()
-            self.target_column = 'failover_event'
-            logger.info("✅ Usando 'failover_event' como target (eventos únicos)")
-            logger.info(f"   - Total failovers: {y.sum()}")
-        else:
-            y = df['should_failover'].copy()
-            self.target_column = 'should_failover'
-            logger.warning("⚠️ Usando 'should_failover' como target (registros duplicados)")
-            logger.warning(f"   - Total registros con failover: {y.sum()}")
-            logger.warning(f"   - Considere ejecutar feature_engine para crear failover_event")
-        
-        # ✅ Manejar valores NULL
-        if X.isnull().any().any():
-            null_counts = X.isnull().sum()
-            null_features = null_counts[null_counts > 0]
-            logger.warning(f"⚠️ Valores NULL detectados en {len(null_features)} features")
-            X = X.fillna(0)
-        
-        # ✅ Convertir booleanos a int
+        logger.info("\n🔧 Preparando features desde ml_features...")
+
+        if 'target_decision' not in df.columns:
+            raise ValueError("❌ Falta la columna target_decision en el DataFrame")
+
+        # Filtrar filas sin target válido (no deberían existir si
+        # feature_engine_incremental.py ya excluyó error/failover_inmediato,
+        # pero se valida por robustez)
+        df = df[df['target_decision'].isin(DECISION_CLASSES)].copy()
+        if df.empty:
+            raise ValueError("❌ No hay filas con target_decision válido "
+                              f"(esperado uno de {DECISION_CLASSES})")
+
+        exclude = LEAKAGE_FEATURES | IDENTIFIER_COLUMNS
+        candidate_cols = [c for c in df.columns if c not in exclude]
+
+        excluded_present = [c for c in df.columns if c in LEAKAGE_FEATURES]
+        if excluded_present:
+            logger.info(f"   🚫 Excluidas por fuga de datos: {excluded_present}")
+
+        X = df[candidate_cols].copy()
+
+        # Encoding de categóricas
+        for col, mapping in CATEGORICAL_FEATURES.items():
+            if col in X.columns:
+                X[col] = X[col].map(mapping).fillna(-1).astype(int)
+
+        # Booleanas -> int
+        for col in BOOLEAN_FEATURES:
+            if col in X.columns:
+                X[col] = X[col].astype(bool).astype(int)
         for col in X.columns:
             if X[col].dtype == 'bool':
                 X[col] = X[col].astype(int)
-        
-        # ✅ Codificar variables categóricas de severidad
-        severity_map = {'normal': 0, 'warning': 1, 'degraded': 2, 'critical': 3}
-        severity_cols = ['z_score_severity', 'absolute_severity', 
-                        'relative_severity', 'combined_severity']
-        
-        for col in severity_cols:
-            if col in X.columns:
-                X[col] = X[col].map(severity_map).fillna(0).astype(int)
-                logger.info(f"   ✓ {col}: encoded (normal=0, warning=1, degraded=2, critical=3)")
-        
-        # ✅ Guardar features usadas
-        self.features_used = available_features
-        
-        # ✅ Log de categorías
-        logger.info(f"\n📊 Features organizadas por categoría:")
-        logger.info(f"   🔹 Base (métricas de red): {len([f for f in base_features if f in available_features])}")
-        logger.info(f"   🔹 Derivadas (métricas compuestas): {len([f for f in derived_features if f in available_features])}")
-        logger.info(f"   🔹 Rolling (estadísticas móviles): {len([f for f in rolling_features if f in available_features])}")
-        logger.info(f"   🔹 Degradación (contexto BGP): {len([f for f in degradation_features if f in available_features])}")
-        logger.info(f"   🔹 Temporal (contexto horario): {len([f for f in temporal_features if f in available_features])}")
-        logger.info(f"   🔹 Detección Combinada: {len([f for f in combined_detection_features if f in available_features])}")
-        logger.info(f"   📈 Total: {len(available_features)} features")
-        logger.info(f"   ❌ ELIMINADAS (data leakage): degradation_cycle")
-        
-        return X, y, available_features
-    
-    def train_with_cv(self, df, n_splits=5, random_state=42):
-        """
-        ✅ NUEVO: Entrena con Stratified K-Fold Cross-Validation
-        """
-        logger.info("\n" + "=" * 80)
-        logger.info("🤖 XGBoost: Cross-Validation (VERSIÓN CORREGIDA)")
-        logger.info("=" * 80)
-        
-        # Preparar datos
-        X, y, features = self.prepare_features(df)
-        
-        logger.info(f"\n📊 Dataset:")
-        logger.info(f"   Total samples: {len(X)}")
-        logger.info(f"   Features: {len(features)}")
-        
-        logger.info(f"\n⚖️ Balance de clases:")
-        for label in [0, 1]:
-            count = (y == label).sum()
-            pct = count / len(y) * 100
-            label_name = "No Failover" if label == 0 else "Failover"
-            logger.info(f"   {label_name:15s}: {count:6d} ({pct:5.1f}%)")
-        
-        # ✅ Validar que hay suficientes failovers para CV
-        n_failovers = (y == 1).sum()
-        if n_failovers < n_splits:
-            logger.warning(f"⚠️ Solo {n_failovers} failovers para {n_splits} folds")
-            logger.warning(f"   Reduciendo n_splits a {n_failovers}")
-            n_splits = max(2, n_failovers)
-        
-        # ✅ Configurar Stratified K-Fold
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        
-        # ✅ Configurar modelo con regularización aumentada
-        scale_pos_weight = (y == 0).sum() / (y == 1).sum() if (y == 1).sum() > 0 else 1.0
-        
-        logger.info(f"\n🔄 Entrenando con {n_splits}-Fold Cross-Validation...")
-        logger.info(f"   scale_pos_weight: {scale_pos_weight:.2f}")
-        logger.info(f"   max_depth: 3 (reducido de 6 para evitar overfitting)")
-        logger.info(f"   learning_rate: 0.05 (reducido de 0.1)")
-        logger.info(f"   reg_alpha: 0.1 (L1 regularization)")
-        logger.info(f"   reg_lambda: 1.0 (L2 regularization)")
-        
-        # ✅ Almacenar resultados por fold
-        fold_metrics = {
-            'accuracy': [],
-            'precision': [],
-            'recall': [],
-            'f1': [],
-            'roc_auc': []
-        }
-        
-        fold_importances = {feat: [] for feat in features}
-        
-        # ✅ Entrenar un modelo por fold
-        for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            
-            # Entrenar modelo
-            model = xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.7,
-                scale_pos_weight=scale_pos_weight,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
-                random_state=random_state,
-                use_label_encoder=False,
-                eval_metric='logloss',
-                verbose=0
+
+        # NULLs -> 0 (loss/z-score con varianza cero quedan NULL por diseño,
+        # ver feature_engine_incremental.py — 0 es una imputación razonable:
+        # "sin desviación detectable" cuando no hay suficiente historia o
+        # varianza)
+        n_nulls = X.isnull().sum().sum()
+        if n_nulls > 0:
+            logger.warning(f"⚠️ {n_nulls} valores NULL detectados — imputando con 0")
+            X = X.fillna(0)
+
+        # ⚠️ FIX: fillna(0) reemplaza los valores pero NO cambia el dtype de
+        # la columna. Con conexión psycopg2 "cruda" (no SQLAlchemy), una
+        # columna con muchos/todos NULL (ej. z_score_loss1/2 cuando nunca
+        # hubo pérdida simulada, o time_since_last_change_min antes del
+        # primer cambio de provider) llega como dtype=object con None de
+        # Python adentro — el mismo problema de tipos que ya resolvimos para
+        # la columna 'time' en feature_engine_incremental.py. fillna(0) deja
+        # el VALOR en 0 pero el dtype sigue siendo 'object', y XGBoost
+        # rechaza cualquier columna que no sea int/float/bool. Se fuerza la
+        # conversión numérica explícita acá, columna por columna.
+        object_cols = X.select_dtypes(include='object').columns.tolist()
+        if object_cols:
+            logger.warning(f"⚠️ Forzando conversión numérica en columnas object: {object_cols}")
+            for col in object_cols:
+                X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
+
+        y_encoded = self.label_encoder.transform(df['target_decision'])
+        self.features_used = list(X.columns)
+
+        logger.info(f"📊 Features preparadas: {len(self.features_used)}")
+        logger.info(f"📊 Distribución de clases:")
+        for i, cls in enumerate(self.label_encoder.classes_):
+            count = (y_encoded == i).sum()
+            logger.info(f"   {cls:<15}: {count:4d} ({count/len(y_encoded)*100:5.1f}%)")
+
+        return X, y_encoded, self.features_used
+
+    # ════════════════════════════════════════════════════════════════════
+    # train_with_cv — Stratified K-Fold, métricas macro + ROC-AUC OvR
+    # ════════════════════════════════════════════════════════════════════
+    def train_with_cv(self, df, n_splits=5, random_state=42, best_params=None):
+        logger.info("\n" + "═" * 80)
+        logger.info("🤖 XGBoost multiclase: Cross-Validation")
+        logger.info("═" * 80)
+
+        X, y_encoded, features = self.prepare_features(df)
+
+        # ── Resolver hiperparámetros ──────────────────────────────────────
+        if best_params is not None:
+            hp = best_params
+            logger.info("\n✅ Usando hiperparámetros de tune_hyperparameters()")
+        else:
+            logger.info("\n⚠️ best_params=None → usando defaults con find_optimal_rounds()")
+            default_params = {
+                'max_depth': 3, 'eta': 0.05, 'subsample': 0.8,
+                'colsample_bytree': 0.7, 'reg_alpha': 0.1,
+                'reg_lambda': 1.0, 'min_child_weight': 1,
+            }
+            optimal_n, _ = self.find_optimal_rounds(
+                X, y_encoded, default_params,
+                max_rounds=500, early_stop=15, n_folds=n_splits,
+                random_state=random_state
             )
-            
-            model.fit(X_train, y_train, verbose=False)
-            
-            # Evaluar
+            hp = {**default_params, 'n_estimators': optimal_n}
+
+        n_estimators = hp.get('n_estimators', self.optimal_rounds or 100)
+        max_depth = hp.get('max_depth', 3)
+        learning_rate = hp.get('eta', hp.get('learning_rate', 0.05))
+        subsample = hp.get('subsample', 0.8)
+        colsample_bytree = hp.get('colsample_bytree', 0.7)
+        reg_alpha = hp.get('reg_alpha', 0.1)
+        reg_lambda = hp.get('reg_lambda', 1.0)
+        min_child_weight = hp.get('min_child_weight', 1)
+
+        logger.info(f"\n   Hiperparámetros a usar:")
+        logger.info(f"   n_estimators     = {n_estimators}")
+        logger.info(f"   max_depth        = {max_depth}")
+        logger.info(f"   learning_rate    = {learning_rate:.4f}")
+        logger.info(f"   subsample        = {subsample:.2f}")
+        logger.info(f"   colsample_bytree = {colsample_bytree:.2f}")
+        logger.info(f"   reg_alpha        = {reg_alpha:.4f}")
+        logger.info(f"   reg_lambda       = {reg_lambda:.4f}")
+        logger.info(f"   min_child_weight = {min_child_weight}")
+
+        # ── Validar folds contra la clase minoritaria ──────────────────────
+        class_counts = np.bincount(y_encoded, minlength=self.num_class)
+        min_class_count = class_counts[class_counts > 0].min()
+        if min_class_count < n_splits:
+            logger.warning(f"⚠️ Clase minoritaria tiene {min_class_count} muestras "
+                           f"para {n_splits} folds → reduciendo a {max(2, min_class_count)}")
+            n_splits = max(2, min_class_count)
+
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+        fold_metrics = {
+            'precision_macro': [], 'recall_macro': [], 'f1_macro': [], 'roc_auc_ovr': [],
+        }
+        fold_importances = {feat: [] for feat in features}
+
+        logger.info(f"\n🔄 {n_splits}-Fold Stratified CV (multiclase, promediado macro)...")
+
+        for fold, (train_idx, test_idx) in enumerate(skf.split(X, y_encoded), 1):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
+
+            sample_weight = compute_sample_weight(class_weight='balanced', y=y_train)
+
+            model = xgb.XGBClassifier(
+                objective='multi:softprob',
+                num_class=self.num_class,
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                subsample=subsample,
+                colsample_bytree=colsample_bytree,
+                min_child_weight=min_child_weight,
+                reg_alpha=reg_alpha,
+                reg_lambda=reg_lambda,
+                random_state=random_state,
+                eval_metric='mlogloss',
+                verbosity=0,
+            )
+            model.fit(X_train, y_train, sample_weight=sample_weight, verbose=False)
+
             y_pred = model.predict(X_test)
-            y_pred_proba = model.predict_proba(X_test)[:, 1]
-            
-            fold_metrics['accuracy'].append(accuracy_score(y_test, y_pred))
-            fold_metrics['precision'].append(precision_score(y_test, y_pred, zero_division=0))
-            fold_metrics['recall'].append(recall_score(y_test, y_pred, zero_division=0))
-            fold_metrics['f1'].append(f1_score(y_test, y_pred, zero_division=0))
-            
+            y_pred_proba = model.predict_proba(X_test)
+
+            fold_metrics['precision_macro'].append(
+                precision_score(y_test, y_pred, average='macro', zero_division=0))
+            fold_metrics['recall_macro'].append(
+                recall_score(y_test, y_pred, average='macro', zero_division=0))
+            fold_metrics['f1_macro'].append(
+                f1_score(y_test, y_pred, average='macro', zero_division=0))
+
             try:
-                roc_auc = roc_auc_score(y_test, y_pred_proba)
-                fold_metrics['roc_auc'].append(roc_auc)
-            except:
-                fold_metrics['roc_auc'].append(0.0)
-            
-            # Guardar importancias
+                # ROC-AUC OvR requiere que TODAS las clases estén presentes en y_test
+                present_classes = np.unique(y_test)
+                if len(present_classes) >= 2:
+                    fold_metrics['roc_auc_ovr'].append(
+                        roc_auc_score(y_test, y_pred_proba, multi_class='ovr',
+                                       average='macro', labels=list(range(self.num_class)))
+                    )
+                else:
+                    fold_metrics['roc_auc_ovr'].append(np.nan)
+            except Exception as e:
+                logger.warning(f"   ⚠️ ROC-AUC no calculable en fold {fold}: {e}")
+                fold_metrics['roc_auc_ovr'].append(np.nan)
+
             for feat, imp in zip(features, model.feature_importances_):
                 fold_importances[feat].append(imp)
-            
-            # Log del fold
+
             logger.info(
                 f"   Fold {fold}/{n_splits}: "
-                f"Accuracy={fold_metrics['accuracy'][-1]:.3f}, "
-                f"F1={fold_metrics['f1'][-1]:.3f}, "
-                f"ROC-AUC={fold_metrics['roc_auc'][-1]:.3f}"
+                f"Precision={fold_metrics['precision_macro'][-1]:.3f} | "
+                f"Recall={fold_metrics['recall_macro'][-1]:.3f} | "
+                f"F1={fold_metrics['f1_macro'][-1]:.3f} | "
+                f"ROC-AUC(OvR)={fold_metrics['roc_auc_ovr'][-1]:.3f}"
             )
-        
-        # ✅ Guardar resultados de CV
+
         self.cv_scores = fold_metrics
         self.cv_importances = fold_importances
-        
-        # ✅ Calcular promedios y desviaciones
-        logger.info(f"\n📊 Cross-Validation Results ({n_splits} folds):")
+
+        logger.info(f"\n📊 Cross-Validation Results ({n_splits} folds, macro-average):")
         logger.info("-" * 80)
-        
         for metric, values in fold_metrics.items():
-            mean_val = np.mean(values)
-            std_val = np.std(values)
-            logger.info(f"   {metric:12s}: {mean_val:.4f} ± {std_val:.4f}")
-        
-        # ✅ Calcular importancia promedio y desviación por feature
-        avg_importances = {}
-        std_importances = {}
-        
-        for feat in features:
-            values = fold_importances[feat]
-            avg_importances[feat] = np.mean(values)
-            std_importances[feat] = np.std(values)
-        
-        # ✅ Crear DataFrame de importancia
+            valid = [v for v in values if not np.isnan(v)]
+            if valid:
+                logger.info(f"   {metric:<18}: {np.mean(valid):.4f} ± {np.std(valid):.4f}")
+
+        avg_importances = {f: float(np.mean(fold_importances[f])) for f in features}
+        std_importances = {f: float(np.std(fold_importances[f])) for f in features}
+
         self.feature_importance = pd.DataFrame({
             'feature': features,
             'importance': [avg_importances[f] for f in features],
-            'importance_std': [std_importances[f] for f in features]
+            'importance_std': [std_importances[f] for f in features],
         }).sort_values('importance', ascending=False)
-        
         self.feature_importance_std = self.feature_importance['importance_std'].values
-        
-        # ✅ Entrenar modelo final con todos los datos (para predicción)
-        logger.info(f"\n🔄 Entrenando modelo final con todos los datos...")
+
+        logger.info(f"\n🔄 Entrenando modelo final ({n_estimators} rondas, todos los datos)...")
+        full_sample_weight = compute_sample_weight(class_weight='balanced', y=y_encoded)
         self.model = xgb.XGBClassifier(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.7,
-            scale_pos_weight=scale_pos_weight,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=random_state,
-            use_label_encoder=False,
-            eval_metric='logloss',
-            verbose=0
+            objective='multi:softprob', num_class=self.num_class,
+            n_estimators=n_estimators, max_depth=max_depth, learning_rate=learning_rate,
+            subsample=subsample, colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight, reg_alpha=reg_alpha, reg_lambda=reg_lambda,
+            random_state=random_state, eval_metric='mlogloss', verbosity=0,
         )
-        self.model.fit(X, y, verbose=False)
-        
-        # ✅ Analizar estabilidad de features
+        self.model.fit(X, y_encoded, sample_weight=full_sample_weight, verbose=False)
+
         self.analyze_feature_stability()
-        
+        if self.learning_curve_data is not None:
+            self.analyze_learning_curve()
+
         return self.feature_importance
-    
+
+    # ════════════════════════════════════════════════════════════════════
+    # Estabilidad de features entre folds — sin cambios de fondo
+    # ════════════════════════════════════════════════════════════════════
     def analyze_feature_stability(self):
-        """
-        ✅ NUEVO: Analiza la estabilidad de las features entre folds
-        """
         logger.info(f"\n📊 Análisis de Estabilidad de Features:")
         logger.info("-" * 80)
-        
+
         stability_data = []
-        
         for _, row in self.feature_importance.iterrows():
-            feat = row['feature']
-            mean_imp = row['importance']
-            std_imp = row['importance_std']
-            
-            if mean_imp > 0.001:
-                cv = std_imp / mean_imp
-            else:
-                cv = 0.0
-            
-            if cv < 0.3:
-                stability = "✅ ESTABLE"
-            elif cv < 0.7:
-                stability = "⚠️ MODERADA"
-            else:
-                stability = "❌ INESTABLE"
-            
-            stability_data.append({
-                'feature': feat,
-                'mean': mean_imp,
-                'std': std_imp,
-                'cv': cv,
-                'stability': stability
-            })
-        
+            feat, mean_imp, std_imp = row['feature'], row['importance'], row['importance_std']
+            cv = std_imp / mean_imp if mean_imp > 0.001 else 0.0
+            stability = ("✅ ESTABLE" if cv < 0.3 else
+                         "⚠️ MODERADA" if cv < 0.7 else "❌ INESTABLE")
+            stability_data.append({'feature': feat, 'mean': mean_imp,
+                                    'std': std_imp, 'cv': cv, 'stability': stability})
+
         stability_df = pd.DataFrame(stability_data).sort_values('mean', ascending=False)
-        
+
         for _, row in stability_df.head(15).iterrows():
             bar = "█" * int(row['mean'] * 100 / 2)
-            logger.info(
-                f"   {row['feature']:25s} {bar:25s} "
-                f"{row['mean']*100:5.1f}% ± {row['std']*100:4.1f}% "
-                f"(CV={row['cv']:.2f}) {row['stability']}"
-            )
-        
-        stable_count = sum(1 for d in stability_data if d['cv'] < 0.3)
-        moderate_count = sum(1 for d in stability_data if 0.3 <= d['cv'] < 0.7)
-        unstable_count = sum(1 for d in stability_data if d['cv'] >= 0.7)
-        
-        logger.info(f"\n📋 Resumen de Estabilidad:")
-        logger.info(f"   ✅ Estables (CV < 0.3):     {stable_count:2d} features")
-        logger.info(f"   ⚠️ Moderadas (0.3 ≤ CV < 0.7): {moderate_count:2d} features")
-        logger.info(f"   ❌ Inestables (CV ≥ 0.7):   {unstable_count:2d} features")
-        
+            logger.info(f"   {row['feature']:28s} {bar:25s} "
+                        f"{row['mean']*100:5.1f}% ± {row['std']*100:4.1f}% "
+                        f"(CV={row['cv']:.2f}) {row['stability']}")
+
+        stable = sum(1 for d in stability_data if d['cv'] < 0.3)
+        moderate = sum(1 for d in stability_data if 0.3 <= d['cv'] < 0.7)
+        unstable = sum(1 for d in stability_data if d['cv'] >= 0.7)
+        logger.info(f"\n   ✅ Estables: {stable:2d} | ⚠️ Moderadas: {moderate:2d} | "
+                    f"❌ Inestables: {unstable:2d}")
+
         return stability_df
-    
+
+    # ════════════════════════════════════════════════════════════════════
+    # get_optimized_weights — agrupado por la taxonomía REAL (peer/dns/
+    # jitter/loss/score_compuesto/contextual/contexto_cambios/provider)
+    # ════════════════════════════════════════════════════════════════════
     def get_optimized_weights(self):
-        """
-        ✅ MEJORADO: Extrae pesos optimizados usando importancias PROMEDIADAS de CV
-        """
         if self.feature_importance is None:
-            logger.error("❌ Debes entrenar el modelo primero")
+            logger.error("❌ Entrenar el modelo primero")
             return None
-        
-        logger.info("\n" + "=" * 80)
-        logger.info("📈 PESOS OPTIMIZADOS (Promedio de Cross-Validation)")
-        logger.info("=" * 80)
-        
-        # Mostrar Top 20 features
-        logger.info("\n🔍 Top 20 características más importantes:")
+
+        logger.info("\n" + "═" * 80)
+        logger.info("📈 PESOS OPTIMIZADOS (Promedio Cross-Validation, multiclase)")
+        logger.info("═" * 80)
+
+        imp_map = dict(zip(self.feature_importance['feature'], self.feature_importance['importance']))
+
+        logger.info("\n🔍 Top 20 features:")
         for idx, (_, row) in enumerate(self.feature_importance.head(20).iterrows(), 1):
-            feature = row['feature']
-            importance = row['importance']
-            std = row['importance_std']
-            pct = importance * 100
-            std_pct = std * 100
+            pct = row['importance'] * 100
             bar = "█" * int(pct / 2)
-            logger.info(f"   {idx:2d}. {feature:25s} {bar:25s} {pct:5.1f}% ± {std_pct:4.1f}%")
-        
-        # Helper para obtener importancia
-        def get_importance(feature_name):
-            matches = self.feature_importance[
-                self.feature_importance['feature'] == feature_name
-            ]
-            if len(matches) > 0:
-                return matches['importance'].values[0]
-            return 0.0
-        
-        # === Extraer importancias por categoría ===
-        
-        # CATEGORÍA 1: Latencia Base
-        peer_lat = get_importance('peer_latency_ms')
-        dns_lat = get_importance('dns_latency_ms')
-        
-        # CATEGORÍA 2: Pérdida
-        peer_loss = get_importance('peer_loss_pct')
-        dns_loss = get_importance('dns_loss_pct')
-        
-        # CATEGORÍA 3: Jitter
-        peer_jitter = get_importance('peer_jitter_ms')
-        dns_jitter = get_importance('dns_jitter_ms')
-        
-        # CATEGORÍA 4: Rolling Statistics
-        rolling_mean = get_importance('rolling_mean')
-        rolling_std = get_importance('rolling_std')
-        rolling_p95 = get_importance('rolling_p95')
-        rolling_total = rolling_mean + rolling_std + rolling_p95
-        
-        # CATEGORÍA 5: Features Derivadas
-        latency_ratio = get_importance('latency_ratio')
-        total_loss = get_importance('total_loss_pct')
-        quality_index = get_importance('quality_index')
-        derived_total = latency_ratio + total_loss + quality_index
-        
-        # CATEGORÍA 6: Degradación (SIN degradation_cycle)
-        score_diff = get_importance('score_difference')
-        margin_exceeds = get_importance('margin_exceeds_threshold')
-        degradation_total = score_diff + margin_exceeds
-        
-        # CATEGORÍA 7: Contexto Temporal
-        hour_importance = get_importance('hour_of_day')
-        is_peak_importance = get_importance('is_peak_traffic')
-        is_weekend_importance = get_importance('is_weekend')
-        temporal_total = hour_importance + is_peak_importance + is_weekend_importance
-        
-        # CATEGORÍA 8: Detección Combinada
-        z_score_peer = get_importance('z_score_peer')
-        z_score_sev = get_importance('z_score_severity')
-        absolute_sev = get_importance('absolute_severity')
-        relative_diff = get_importance('relative_diff_ms')
-        relative_sev = get_importance('relative_severity')
-        combined_sev = get_importance('combined_severity')
-        is_anomaly = get_importance('is_combined_anomaly')
-        combined_detection_total = (
-            z_score_peer + z_score_sev + absolute_sev + 
-            relative_diff + relative_sev + combined_sev + is_anomaly
-        )
-        
-        # === Normalizar pesos de latencia ===
-        total_latency = peer_lat + dns_lat
-        if total_latency > 0:
-            peer_weight = peer_lat / total_latency
-            dns_weight = dns_lat / total_latency
-        else:
-            peer_weight = 0.7
-            dns_weight = 0.3
-        
-        # === Interpretación ===
-        logger.info("\n" + "-" * 80)
-        logger.info("📊 ANÁLISIS POR CATEGORÍA:")
-        logger.info("-" * 80)
-        
-        # 1. Latencia
-        logger.info(f"\n🎯 PESOS DE LATENCIA OPTIMIZADOS:")
-        logger.info(f"   Peer Latency:    {peer_weight:.2%} (actual: 70.00%)")
-        logger.info(f"   DNS Latency:     {dns_weight:.2%} (actual: 30.00%)")
-        if abs(peer_weight - 0.70) > 0.05:
-            if peer_weight > 0.70:
-                logger.info(f"   ➜ Peer latency es SIGNIFICATIVAMENTE más importante")
-                logger.info(f"     Recomendación: Aumentar peer_weight de 0.70 a {peer_weight:.2f}")
-            else:
-                logger.info(f"   ➜ DNS latency es SIGNIFICATIVAMENTE más importante")
-                logger.info(f"     Recomendación: Reducir peer_weight de 0.70 a {peer_weight:.2f}")
-        else:
-            logger.info(f"   ➜ ✅ Pesos actuales son aproximadamente óptimos")
-        
-        # 2. Pérdida
-        loss_importance = max(peer_loss, dns_loss)
-        logger.info(f"\n⚠️ IMPORTANCIA DE PÉRDIDA:")
-        logger.info(f"   Peer Loss: {peer_loss*100:.2f}%")
-        logger.info(f"   DNS Loss:  {dns_loss*100:.2f}%")
-        logger.info(f"   ➜ Pérdida es {loss_importance*100:.1f}% importante")
-        
-        # 3. Jitter
-        jitter_importance = max(peer_jitter, dns_jitter)
-        logger.info(f"\n⚡ IMPORTANCIA DE JITTER:")
-        logger.info(f"   Peer Jitter: {peer_jitter*100:.2f}%")
-        logger.info(f"   DNS Jitter:  {dns_jitter*100:.2f}%")
-        logger.info(f"   ➜ Jitter es {jitter_importance*100:.1f}% importante")
-        
-        # 4. Rolling Statistics
-        logger.info(f"\n📈 IMPORTANCIA DE ROLLING STATISTICS:")
-        logger.info(f"   rolling_mean: {rolling_mean*100:.2f}%")
-        logger.info(f"   rolling_std:  {rolling_std*100:.2f}%")
-        logger.info(f"   rolling_p95:  {rolling_p95*100:.2f}%")
-        logger.info(f"   Total:        {rolling_total*100:.2f}%")
-        if rolling_total > 0.10:
-            logger.info(f"   ➜ 🔥 ALTA IMPORTANCIA: Anomalías relativas son CRÍTICAS")
-        elif rolling_total > 0.05:
-            logger.info(f"   ➜ ✅ IMPORTANCIA MODERADA")
-        else:
-            logger.info(f"   ➜ ℹ️ BAJA IMPORTANCIA")
-        
-        # 5. Features Derivadas
-        logger.info(f"\n🔗 IMPORTANCIA DE FEATURES DERIVADAS:")
-        logger.info(f"   latency_ratio:  {latency_ratio*100:.2f}%")
-        logger.info(f"   total_loss_pct: {total_loss*100:.2f}%")
-        logger.info(f"   quality_index:  {quality_index*100:.2f}%")
-        logger.info(f"   Total:          {derived_total*100:.2f}%")
-        
-        # 6. Degradación (SIN degradation_cycle)
-        logger.info(f"\n🎚️ IMPORTANCIA DE DEGRADACIÓN (sin data leakage):")
-        logger.info(f"   score_difference:         {score_diff*100:.2f}%")
-        logger.info(f"   margin_exceeds_threshold: {margin_exceeds*100:.2f}%")
-        logger.info(f"   Total:                    {degradation_total*100:.2f}%")
-        logger.info(f"   ❌ ELIMINADO: degradation_cycle (data leakage)")
-        
-        # 7. Contexto Temporal
-        logger.info(f"\n🕐 IMPORTANCIA CONTEXTUAL:")
-        logger.info(f"   Hour of Day:  {hour_importance*100:.2f}%")
-        logger.info(f"   Peak Traffic: {is_peak_importance*100:.2f}%")
-        logger.info(f"   Weekend:      {is_weekend_importance*100:.2f}%")
-        logger.info(f"   Total:        {temporal_total*100:.2f}%")
-        
-        # 8. Detección Combinada
-        logger.info(f"\n🎯 IMPORTANCIA DE DETECCIÓN COMBINADA:")
-        logger.info(f"   z_score_peer:        {z_score_peer*100:.2f}%")
-        logger.info(f"   z_score_severity:    {z_score_sev*100:.2f}%")
-        logger.info(f"   absolute_severity:   {absolute_sev*100:.2f}%")
-        logger.info(f"   relative_diff_ms:    {relative_diff*100:.2f}%")
-        logger.info(f"   relative_severity:   {relative_sev*100:.2f}%")
-        logger.info(f"   combined_severity:   {combined_sev*100:.2f}%")
-        logger.info(f"   is_combined_anomaly: {is_anomaly*100:.2f}%")
-        logger.info(f"   Total:               {combined_detection_total*100:.2f}%")
-        if combined_detection_total > 0.15:
-            logger.info(f"   ➜ 🔥 CRÍTICO: La detección combinada es ESENCIAL")
-        elif combined_detection_total > 0.05:
-            logger.info(f"   ➜ ✅ IMPORTANTE: La detección combinada aporta valor")
-        else:
-            logger.info(f"   ➜ ℹ️ BAJA IMPORTANCIA")
-        
-        # === Resumen ejecutivo ===
-        logger.info("\n" + "-" * 80)
-        logger.info("📋 RESUMEN EJECUTIVO:")
-        logger.info("-" * 80)
-        
-        category_totals = {
-            'Latencia Base': peer_lat + dns_lat,
-            'Pérdida': peer_loss + dns_loss,
-            'Jitter': peer_jitter + dns_jitter,
-            'Rolling Stats': rolling_total,
-            'Features Derivadas': derived_total,
-            'Degradación (BGP)': degradation_total,
-            'Contexto Temporal': temporal_total,
-            'Detección Combinada': combined_detection_total
-        }
-        
-        sorted_categories = sorted(
-            category_totals.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
-        
-        for idx, (category, total) in enumerate(sorted_categories, 1):
+            logger.info(f"   {idx:2d}. {row['feature']:28s} {bar:25s} "
+                        f"{pct:5.1f}% ± {row['importance_std']*100:4.1f}%")
+
+        group_totals = {}
+        for group, cols in FEATURE_GROUPS.items():
+            group_totals[group] = float(sum(imp_map.get(c, 0.0) for c in cols))
+
+        logger.info("\n📋 RESUMEN POR FAMILIA (taxonomía ml_features):")
+        for group, total in sorted(group_totals.items(), key=lambda x: -x[1]):
             pct = total * 100
             bar = "█" * int(pct / 2)
-            logger.info(f"   {idx}. {category:25s} {bar:25s} {pct:5.1f}%")
-        
-        # === Resumen de CV ===
+            logger.info(f"   {group:20s} {bar:25s} {pct:5.1f}%")
+
+        # ── Traducción a pesos candidatos comparables con la fórmula actual ──
+        # (peer=0.27 / dns=0.50 / jitter=0.23 — loss entra como multiplicador,
+        # no como peso, así que se reporta aparte)
+        core = group_totals['peer'] + group_totals['dns'] + group_totals['jitter']
+        candidate_peer_w = group_totals['peer'] / core if core > 0 else 0.27
+        candidate_dns_w = group_totals['dns'] / core if core > 0 else 0.50
+        candidate_jitter_w = group_totals['jitter'] / core if core > 0 else 0.23
+
+        logger.info(f"\n🎯 Pesos candidatos (renormalizados peer+dns+jitter=1, comparables a la fórmula actual):")
+        logger.info(f"   peer   = {candidate_peer_w:.4f}  (actual: 0.27)")
+        logger.info(f"   dns    = {candidate_dns_w:.4f}  (actual: 0.50)")
+        logger.info(f"   jitter = {candidate_jitter_w:.4f}  (actual: 0.23)")
+        logger.info(f"   ⚠️ Esto es solo RANKING (Gain) — para coeficientes lineales")
+        logger.info(f"      directamente interpretables, ver el paso de Logistic Regression.")
+
         if self.cv_scores:
-            logger.info(f"\n📊 Cross-Validation Summary:")
+            logger.info(f"\n📊 Cross-Validation Summary (macro-average):")
             logger.info("-" * 80)
             for metric, values in self.cv_scores.items():
-                mean_val = np.mean(values)
-                std_val = np.std(values)
-                logger.info(f"   {metric:12s}: {mean_val:.4f} ± {std_val:.4f}")
-        
-        # ✅ NUEVO: Información sobre target usado
-        logger.info(f"\n🎯 Target usado: {self.target_column}")
-        
+                valid = [v for v in values if not np.isnan(v)]
+                if valid:
+                    logger.info(f"   {metric:<18}: {np.mean(valid):.4f} ± {np.std(valid):.4f}")
+
+        if self.best_params:
+            logger.info(f"\n⚙️ Hiperparámetros óptimos (Bayesian Optimization):")
+            for k, v in self.best_params.items():
+                fmt = f'{v:.4f}' if isinstance(v, float) else str(v)
+                logger.info(f"   {k:<22}: {fmt}")
+
         return {
-            'peer_latency_weight': float(peer_weight),
-            'dns_latency_weight': float(dns_weight),
-            'loss_importance': float(loss_importance),
-            'jitter_importance': float(jitter_importance),
-            'rolling_importance': float(rolling_total),
-            'derived_importance': float(derived_total),
-            'degradation_importance': float(degradation_total),
-            'context_importance': float(temporal_total),
-            'combined_detection_importance': float(combined_detection_total),
+            'group_importances': group_totals,
+            'candidate_weights': {
+                'peer': float(candidate_peer_w),
+                'dns': float(candidate_dns_w),
+                'jitter': float(candidate_jitter_w),
+            },
+            'current_weights': {'peer': 0.27, 'dns': 0.50, 'jitter': 0.23},
             'all_importances': self.feature_importance.to_dict('list'),
             'cv_scores': self.cv_scores,
             'target_column': self.target_column,
+            'decision_classes': list(self.label_encoder.classes_),
+            'optimal_rounds': self.optimal_rounds,
+            'best_hyperparams': self.best_params,
+            'learning_curve_summary': (self.analyze_learning_curve()
+                                        if self.learning_curve_data is not None else None),
             'recommendations': {
-                'dynamic_thresholds': rolling_total > 0.10,
-                'time_based_thresholds': temporal_total > 0.05,
-                'use_compound_metrics': derived_total > 0.10,
-                'bgp_context_critical': degradation_total > 0.15,
-                'combined_detection_critical': combined_detection_total > 0.15
-            }
+                'temporal_features_matter': group_totals.get('dns', 0) > 0.10 and
+                    any(imp_map.get(c, 0) > 0.02 for c in FEATURE_GROUPS['dns'] if 'z_score' in c or 'cv_' in c or 'trend' in c),
+                'context_matters': group_totals['contextual'] > 0.05,
+                'provider_change_context_matters': group_totals['contexto_cambios'] > 0.05,
+                'composite_score_dominates': group_totals['score_compuesto'] > 0.30,
+            },
         }
-    
-    def predict_failover_probability(self, metrics_dict):
-        """Predice la probabilidad de failover para nuevas métricas"""
-        if self.model is None:
-            raise ValueError("Debes entrenar el modelo primero")
-        
-        if self.features_used is None:
-            raise ValueError("Debes entrenar el modelo primero para conocer las features")
-        
-        # Validar features
+
+    # ════════════════════════════════════════════════════════════════════
+    # Predicción — devuelve probabilidad por clase (no solo failover)
+    # ════════════════════════════════════════════════════════════════════
+    def predict_decision_proba(self, metrics_dict):
+        """Predice P(clase) para las 4 clases de decisión, dado un dict de features."""
+        if self.model is None or self.features_used is None:
+            raise ValueError("Entrenar el modelo primero")
+
         missing = [f for f in self.features_used if f not in metrics_dict]
         if missing:
             logger.warning(f"⚠️ Faltan {len(missing)} features: {missing}")
             for f in missing:
                 metrics_dict[f] = 0
-        
-        X = pd.DataFrame([metrics_dict])[self.features_used]
-        
-        # Convertir booleanos a int
+
+        row = dict(metrics_dict)
+        for col, mapping in CATEGORICAL_FEATURES.items():
+            if col in row and isinstance(row[col], str):
+                row[col] = mapping.get(row[col], -1)
+
+        X = pd.DataFrame([row])[self.features_used]
         for col in X.columns:
             if X[col].dtype == 'bool':
                 X[col] = X[col].astype(int)
-        
-        prob = self.model.predict_proba(X)[0, 1]
-        return prob
+        # Mismo fix que en prepare_features: forzar numérico, ej. si algún
+        # valor llegó como None desde el caller.
+        object_cols = X.select_dtypes(include='object').columns.tolist()
+        for col in object_cols:
+            X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
+
+        proba = self.model.predict_proba(X)[0]
+        return dict(zip(self.label_encoder.classes_, proba.tolist()))
 
 
 if __name__ == '__main__':
-    # Ejemplo de uso
     logging.basicConfig(level=logging.INFO)
-    logger.info("✅ xgboost_optimizer.py cargado correctamente")
-    logger.info("Para usar: from xgboost_optimizer import ScoringWeightOptimizer")
+    logger.info("═" * 80)
+    logger.info("xgboost_optimizer.py v3 — Flujo recomendado (multiclase, Opción A):")
+    logger.info("═" * 80)
+    logger.info("")
+    logger.info("  from xgboost_optimizer import ScoringWeightOptimizer")
+    logger.info("")
+    logger.info("  optimizer = ScoringWeightOptimizer()")
+    logger.info("  best_params = optimizer.tune_hyperparameters(df, n_trials=15)")
+    logger.info("  optimizer.train_with_cv(df, best_params=best_params)")
+    logger.info("  weights = optimizer.get_optimized_weights()")
+    logger.info("  proba = optimizer.predict_decision_proba(metrics_dict)")
+    logger.info("═" * 80)
