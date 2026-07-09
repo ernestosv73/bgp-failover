@@ -1,48 +1,58 @@
 #!/usr/bin/env python3
 """
-synthetic_data_generator.py — Genera datos sintéticos REUTILIZANDO el motor real
+synthetic_data_generator.py — v2: calibrado contra la operación real del ISP
 ═══════════════════════════════════════════════════════════════════════════════
-✅ DIFERENCIA DE FONDO respecto al generador anterior (data_generator.py):
+⚠️ DECLARACIÓN DE ALCANCE Y LIMITACIÓN (importante para el informe/paper):
 
-El generador anterior reimplementaba su propia versión de la fórmula de scoring
-(pesos legacy 0.4/0.6/0.5/0.5, sin normalizar), su propia lógica de detección
-(z-score/absolute/relative/combined severity — un esquema que nunca existió en
-el motor real), y escribía directamente en ml_features saltándose bgp_metrics_new
-por completo. Resultado: un dataset "sintético" que en realidad no reflejaba el
-comportamiento del sistema que construimos — como bien identificaste, no era
-realista y además quedaba desincronizado cada vez que el motor cambiaba.
+Este script NO pretende generar un dataset representativo de la red real del
+ISP. Genera datos ALEATORIOS/SINTÉTICOS con el único propósito de EJERCITAR
+el pipeline completo (motor → TimescaleDB → feature engine → entrenamiento)
+de punta a punta, ante la imposibilidad práctica de capturar un dataset real
+completo dentro del plazo de este trabajo.
 
-Este generador NO reimplementa nada de la lógica de decisión. En cambio:
-├─ Importa BGPFailoverEngine y LatencyMetrics DIRECTAMENTE de
-│   bgp_failover_engine_new.py (el motor real, v2.6)
-├─ Sobrescribe ÚNICAMENTE measure_provider_latency() — el único punto que
-│   normalmente ejecuta MTR — para devolver métricas sintéticas en vez de
-│   medir la red real
-├─ Todo lo demás (calculate_scores, should_switch_provider, degradation/
-│   improvement counters, bypass de seguridad, send_metrics_to_timescaledb)
-│   corre SIN MODIFICAR — exactamente el mismo código que ya está validado
-│   en Containerlab
-└─ Escribe en bgp_metrics_new (la tabla real), no en ml_features — para
-   derivar ml_features se sigue usando feature_engine_incremental.py después,
-   igual que con datos reales. Esto es justo lo que señalaste: generar
-   directamente en ml_features se salta el pipeline real y es menos preciso,
-   no menos complejo.
+La secuencia de contribuciones de este trabajo es, en orden:
+  1. Demostrar que el motor de failover funciona correctamente en una
+     topología Containerlab, almacena histórico, deriva features y permite
+     entrenar un modelo — CON DATOS REALES capturados de esa topología
+     (bgp_metrics_new con tráfico real generado en el laboratorio).
+  2. Señalar que el valor real de Etapa 3 (recalibrar pesos/umbrales) requiere
+     un dataset capturado de la operación real de un ISP — que este mismo
+     stack (motor + TimescaleDB + feature engine) ya está en condiciones de
+     recolectar, una vez desplegado en producción.
+  3. Ante la imposibilidad de tener ESE dataset real dentro de este plazo,
+     se propone este generador como banco de pruebas del pipeline de
+     entrenamiento — con la limitación explícita de que es data aleatoria,
+     no observación real de red.
 
-✅ ALCANCE v1 (según lo acordado):
-├─ SIN pérdida de paquetes (loss1/loss2 = 0 siempre) — coherente con que el
-│   bypass de seguridad y loss_norm/severity_multiplier no se ejercitan aún
-├─ Escenarios calibrados contra el CSV real de 40 ciclos (topología propia):
-│   baseline normal + episodios de degradación con rampa (no saltos
-│   instantáneos) en DNS1 y/o DNS2, coherente con los dos episodios
-│   degradación→failover→retorno observados en la captura real
-└─ Timestamps sintéticos con intervalo real medido (~45s/ciclo, no los 30s
-   nominales de CYCLE_INTERVAL — ver conversación: el ciclo real incluye el
-   tiempo de ejecución de MTR además del sleep configurado)
+✅ CALIBRACIÓN v2 — contra la entrevista al ISP (no contra el CSV genérico
+de v1). Datos aportados por el ISP:
+├─ Los umbrales de latencia que usan son IDÉNTICOS a los de esta simulación
+│   (30ms/60ms DNS1/DNS2) — consistente, no requiere recalibrar severidad.
+├─ Aplican failover/retorno tras **15 minutos** de latencia sostenida — no
+│   los 90s (3 ciclos) de nuestro motor de laboratorio.
+├─ Frecuencia real: **2-3 failovers por semana**, SIEMPRE en horario pico de
+│   demanda — no eventos uniformemente distribuidos las 24h.
+└─ ⚠️ Supuestos que NO se pudieron confirmar con el ISP (declarar como tales
+   en el informe si se citan estos números):
+   - Horario pico: se asume 4 horas/día (no confirmado por el ISP).
+   - Cadencia de medición real del ISP: desconocida — el ISP monitorea con
+     ping continuo pero no especificó el intervalo de muestreo. Se usa como
+     aproximación la cadencia de nuestro propio motor (~45s/ciclo medida
+     empíricamente), así que "15 minutos" se traduce a ~20 ciclos. Esta
+     equivalencia es una aproximación de trabajo, NO un dato confirmado.
 
 USO:
-    python3 synthetic_data_generator.py --cycles 300
-    python3 synthetic_data_generator.py --cycles 300 --episode-probability 0.05 --seed 7
-    python3 synthetic_data_generator.py --cycles 300 --csv-mirror /tmp/synthetic.csv
+    # Modo laboratorio (v1, alta frecuencia, umbral de 3 ciclos — para
+    # iterar rápido y probar que el pipeline funciona):
+    python3 synthetic_data_generator.py --scale lab --cycles 300
+
+    # Modo "realista" (calibrado contra el ISP — para el análisis de Etapa 3):
+    python3 synthetic_data_generator.py --scale realistic --cycles 100000
+
+    # Parámetros de calibración ajustables manualmente:
+    python3 synthetic_data_generator.py --scale realistic --cycles 50000 \\
+        --events-per-week 2.5 --peak-hour-start 19 --peak-hour-duration 4 \\
+        --confirmation-cycles 20
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import argparse
@@ -59,13 +69,10 @@ from bgp_failover_engine_new import BGPFailoverEngine, LatencyMetrics
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ✅ Intervalo real medido entre ciclos en Containerlab (ver conversación:
-# CYCLE_INTERVAL=30s de sleep + ~15s de ejecución MTR ≈ 44.9s reales)
 REAL_CYCLE_INTERVAL_SECONDS = 45
 
-# ✅ Rangos calibrados contra el CSV real de 40 ciclos (topología propia)
 BASELINE = {
-    'peer_avg':  (5.5, 1.5),   # (media, desvío) para np.random.normal
+    'peer_avg':  (5.5, 1.5),
     'peer_stddev': (3.0, 1.3),
     'dns1_avg':  (6.5, 2.0),
     'dns1_stddev': (3.0, 1.6),
@@ -73,20 +80,27 @@ BASELINE = {
     'dns2_stddev': (3.0, 1.6),
 }
 
-# Severidad de pico durante un episodio de degradación (ms) — coherente con
-# los breach reales observados (34-66ms sobre umbrales críticos de 30/60ms)
-PEAK_SEVERITY_RANGE_DNS1 = (32, 60)   # umbral crítico DNS1 = 30ms
-PEAK_SEVERITY_RANGE_DNS2 = (62, 90)   # umbral crítico DNS2 = 60ms
-PEAK_JITTER_RANGE = (3, 12)           # ocasionalmente cruza el crítico de jitter (10ms)
+PEAK_SEVERITY_RANGE_DNS1 = (32, 60)
+PEAK_SEVERITY_RANGE_DNS2 = (62, 90)
+PEAK_JITTER_RANGE = (3, 12)
+
+SCALE_PRESETS = {
+    'lab': {
+        'confirmation_cycles': 3,
+        'events_per_week': None,
+        'episode_probability': 0.04,
+        'peak_hour_only': False,
+    },
+    'realistic': {
+        'confirmation_cycles': 20,
+        'events_per_week': 2.5,
+        'episode_probability': None,
+        'peak_hour_only': True,
+    },
+}
 
 
 class _FrozenDateTime(real_datetime_module.datetime):
-    """
-    Permite congelar datetime.now() dentro de bgp_failover_engine_new durante
-    la generación, para que cada ciclo sintético quede timestamped con un
-    instante controlado (no el reloj real de esta corrida) sin tocar el
-    archivo del motor.
-    """
     _fixed_now = None
 
     @classmethod
@@ -96,24 +110,45 @@ class _FrozenDateTime(real_datetime_module.datetime):
 
 class ScenarioGenerator:
     """
-    Máquina de estados simple que decide, ciclo a ciclo, qué métricas RAW
-    emitir. Independiente de la lógica de decisión del motor (esa la maneja
-    el motor real una vez recibe estos números) — este generador solo
-    decide "qué está pasando en la red", no "qué debería hacer el motor".
+    Máquina de estados que decide, ciclo a ciclo, qué métricas RAW emitir.
 
-    Estados: NORMAL -> RAMP_UP -> PLATEAU -> RAMP_DOWN -> NORMAL
+    v2 — dos cambios de calibración respecto a v1:
+    1. La probabilidad de iniciar un episodio puede depender de si el ciclo
+       actual cae en horario pico (peak_hour_only=True).
+    2. La duración del PLATEAU escala con confirmation_cycles.
     """
 
-    def __init__(self, episode_probability=0.04, rng=None):
+    def __init__(self, episode_probability, confirmation_cycles=3,
+                 peak_hour_only=False, peak_hour_start=19, peak_hour_duration=4,
+                 rng=None):
         self.episode_probability = episode_probability
+        self.confirmation_cycles = confirmation_cycles
+        self.peak_hour_only = peak_hour_only
+        self.peak_hour_start = peak_hour_start
+        self.peak_hour_duration = peak_hour_duration
         self.rng = rng or np.random.default_rng()
+
+        self.current_hour = None
+
         self.state = 'NORMAL'
-        self.target = None          # 'dns1' | 'dns2' | 'peer'
+        self.target = None
         self.state_cycles_left = 0
         self.peak_value = None
         self.ramp_start_value = None
         self.ramp_progress = 0
         self.ramp_total = 0
+
+    def set_current_time(self, dt):
+        self.current_hour = dt.hour
+
+    def _in_peak_hour(self):
+        if self.current_hour is None:
+            return True
+        end = (self.peak_hour_start + self.peak_hour_duration) % 24
+        if self.peak_hour_start < end:
+            return self.peak_hour_start <= self.current_hour < end
+        else:
+            return self.current_hour >= self.peak_hour_start or self.current_hour < end
 
     def _sample_baseline(self, key):
         mean, std = BASELINE[key]
@@ -127,13 +162,12 @@ class ScenarioGenerator:
             self.peak_value = float(self.rng.uniform(*PEAK_SEVERITY_RANGE_DNS2))
 
         self.state = 'RAMP_UP'
-        self.ramp_total = int(self.rng.integers(2, 4))     # 2-3 ciclos de rampa
+        self.ramp_total = int(self.rng.integers(2, 4))
         self.ramp_progress = 0
         self.ramp_start_value = self._sample_baseline(f'{self.target}_avg')
         self.state_cycles_left = self.ramp_total
 
     def next_metrics(self):
-        """Devuelve dict con peer_avg/stddev, dns1_avg/stddev, dns2_avg/stddev."""
         m = {
             'peer_avg': self._sample_baseline('peer_avg'),
             'peer_stddev': max(0.1, self._sample_baseline('peer_stddev')),
@@ -144,9 +178,9 @@ class ScenarioGenerator:
         }
 
         if self.state == 'NORMAL':
-            if self.rng.random() < self.episode_probability:
+            can_start = (not self.peak_hour_only) or self._in_peak_hour()
+            if can_start and self.rng.random() < self.episode_probability:
                 self._start_episode()
-                # cae directo a la rama RAMP_UP más abajo en esta misma llamada
             else:
                 return m
 
@@ -159,12 +193,13 @@ class ScenarioGenerator:
             self.state_cycles_left -= 1
             if self.state_cycles_left <= 0:
                 self.state = 'PLATEAU'
-                self.state_cycles_left = int(self.rng.integers(3, 7))  # 3-6 ciclos sostenido
+                self.state_cycles_left = int(
+                    self.rng.integers(self.confirmation_cycles + 2, self.confirmation_cycles + 15)
+                )
 
         elif self.state == 'PLATEAU':
             noise = float(self.rng.normal(0, self.peak_value * 0.03))
             m[f'{self.target}_avg'] = max(0.3, self.peak_value + noise)
-            # jitter a veces también sube durante el plateau (no siempre)
             if self.rng.random() < 0.4:
                 m[f'{self.target}_stddev'] = float(self.rng.uniform(*PEAK_JITTER_RANGE))
             else:
@@ -191,13 +226,6 @@ class ScenarioGenerator:
 
 
 class SyntheticBGPFailoverEngine(BGPFailoverEngine):
-    """
-    Subclase que reemplaza measure_provider_latency() por datos sintéticos.
-    Todo el resto de la lógica (should_switch_provider, calculate_scores,
-    send_metrics_to_timescaledb, etc.) es EXACTAMENTE la del motor real —
-    no se sobrescribe nada más.
-    """
-
     def __init__(self, scenario_generator: ScenarioGenerator):
         self.scenario_generator = scenario_generator
         super().__init__()
@@ -218,11 +246,45 @@ class SyntheticBGPFailoverEngine(BGPFailoverEngine):
         return metrics
 
 
-def generate(cycles, episode_probability, seed, start_time, interval_seconds, csv_mirror_path):
+def compute_calibrated_probability(events_per_week, interval_seconds, peak_hour_duration):
+    cycles_per_day = 86400 / interval_seconds
+    peak_cycles_per_day = cycles_per_day * (peak_hour_duration / 24)
+    peak_cycles_per_week = peak_cycles_per_day * 7
+    return events_per_week / peak_cycles_per_week
+
+
+def generate(cycles, scale, seed, start_time, interval_seconds, csv_mirror_path,
+             events_per_week=None, peak_hour_start=19, peak_hour_duration=4,
+             confirmation_cycles=None, episode_probability_override=None):
+    preset = SCALE_PRESETS[scale]
+
+    resolved_confirmation_cycles = confirmation_cycles or preset['confirmation_cycles']
+    resolved_events_per_week = events_per_week if events_per_week is not None else preset['events_per_week']
+    peak_hour_only = preset['peak_hour_only']
+
+    if episode_probability_override is not None:
+        resolved_probability = episode_probability_override
+    elif resolved_events_per_week is not None:
+        resolved_probability = compute_calibrated_probability(
+            resolved_events_per_week, interval_seconds, peak_hour_duration
+        )
+    else:
+        resolved_probability = preset['episode_probability']
+
+    engine_mod.SUSTAINED_DEGRADATION_CYCLES = resolved_confirmation_cycles
+    engine_mod.RETURN_CONFIRMATION_CYCLES = resolved_confirmation_cycles
+
     rng = np.random.default_rng(seed)
     random.seed(seed)
 
-    scenario = ScenarioGenerator(episode_probability=episode_probability, rng=rng)
+    scenario = ScenarioGenerator(
+        episode_probability=resolved_probability,
+        confirmation_cycles=resolved_confirmation_cycles,
+        peak_hour_only=peak_hour_only,
+        peak_hour_start=peak_hour_start,
+        peak_hour_duration=peak_hour_duration,
+        rng=rng,
+    )
     engine = SyntheticBGPFailoverEngine(scenario)
 
     if not engine.ts_client:
@@ -230,7 +292,6 @@ def generate(cycles, episode_probability, seed, start_time, interval_seconds, cs
                       "Verificar TIMESCALEDB_* en bgp_failover_engine_new.py")
         return
 
-    # Capturar filas insertadas también en memoria, para el espejo CSV opcional
     mirror_rows = []
     if csv_mirror_path:
         original_insert = engine.ts_client.insert_bgp_metrics_new
@@ -241,12 +302,22 @@ def generate(cycles, episode_probability, seed, start_time, interval_seconds, cs
 
         engine.ts_client.insert_bgp_metrics_new = _insert_and_mirror
 
-    # Congelar datetime.now() dentro del módulo del motor, sin tocar su archivo
     engine_mod.datetime = _FrozenDateTime
 
     logger.info("=" * 80)
-    logger.info(f"🎲 Generando {cycles} ciclos sintéticos (motor real v2.6, sin pérdida de paquetes)")
-    logger.info(f"   Probabilidad de episodio por ciclo: {episode_probability:.1%}")
+    logger.info(f"🎲 Generando {cycles} ciclos sintéticos — escala: '{scale}'")
+    logger.info("=" * 80)
+    logger.info(f"   ⚠️ Datos ALEATORIOS para probar el pipeline — NO representativos de red real")
+    logger.info(f"   Ventana de confirmación (SUSTAINED/RETURN_CONFIRMATION_CYCLES): {resolved_confirmation_cycles} ciclos "
+                f"(~{resolved_confirmation_cycles * interval_seconds / 60:.1f} min a {interval_seconds}s/ciclo)")
+    if peak_hour_only:
+        logger.info(f"   Episodios restringidos a horario pico: {peak_hour_start:02d}:00-"
+                     f"{(peak_hour_start + peak_hour_duration) % 24:02d}:00 "
+                     f"({peak_hour_duration}h/día — supuesto, no confirmado por el ISP)")
+        logger.info(f"   Tasa objetivo: {resolved_events_per_week} eventos/semana -> "
+                     f"probabilidad calibrada por ciclo en pico: {resolved_probability:.6f} ({resolved_probability*100:.4f}%)")
+    else:
+        logger.info(f"   Probabilidad de episodio por ciclo (sin restricción horaria): {resolved_probability:.1%}")
     logger.info(f"   Intervalo entre ciclos: {interval_seconds}s | Inicio: {start_time.isoformat()}")
     logger.info(f"   Provider inicial (continúa desde BD): {engine.current_primary_provider}")
     logger.info(f"   Cycle_number inicial (continúa desde BD): {engine.cycle_count}")
@@ -255,15 +326,18 @@ def generate(cycles, episode_probability, seed, start_time, interval_seconds, cs
     current_time = start_time
     for i in range(cycles):
         _FrozenDateTime._fixed_now = current_time
+        scenario.set_current_time(current_time)
         engine.run_cycle()
         current_time = current_time + timedelta(seconds=interval_seconds)
 
-        if (i + 1) % 50 == 0:
+        if (i + 1) % max(1, cycles // 20) == 0:
             logger.info(f"   ✓ {i + 1}/{cycles} ciclos generados")
 
     logger.info("=" * 80)
     logger.info(f"✅ Generación completa: {cycles} ciclos insertados en bgp_metrics_new")
     logger.info(f"   Rango de tiempo simulado: {start_time.isoformat()} → {current_time.isoformat()}")
+    span_weeks = (current_time - start_time).total_seconds() / (86400 * 7)
+    logger.info(f"   Rango simulado: {span_weeks:.2f} semanas")
     logger.info("=" * 80)
 
     if csv_mirror_path and mirror_rows:
@@ -273,26 +347,41 @@ def generate(cycles, episode_probability, seed, start_time, interval_seconds, cs
 
     logger.info("\n🎯 Próximos pasos:")
     logger.info("   1. Ejecutar feature_engine_incremental.py para derivar ml_features")
-    logger.info("      (igual que con datos reales — no se salta el pipeline)")
-    logger.info("   2. Ejecutar train_from_ml_features.py para entrenar/validar el modelo")
+    logger.info("   2. Ejecutar train_logistic_regression.py para entrenar/comparar ambos modelos")
+    if scale == 'realistic':
+        logger.info("\n⚠️ Recordatorio para el informe: este dataset usa parámetros calibrados de")
+        logger.info("   mejor esfuerzo (horario pico asumido en 4h/día, cadencia de medición del ISP")
+        logger.info("   no confirmada) — declarar estos supuestos explícitamente si se citan los")
+        logger.info("   resultados de esta corrida como evidencia.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Genera datos sintéticos en bgp_metrics_new reutilizando el motor real de failover'
+        description='Genera datos sintéticos en bgp_metrics_new reutilizando el motor real de failover. '
+                     'v2: soporta escala "lab" (rápida, para probar el pipeline) y "realistic" '
+                     '(calibrada contra la operación real informada por el ISP).'
     )
     parser.add_argument('--cycles', type=int, default=300, help='Cantidad de ciclos a generar (default: 300)')
-    parser.add_argument('--episode-probability', type=float, default=0.04,
-                         help='Probabilidad por ciclo de iniciar un episodio de degradación (default: 0.04)')
+    parser.add_argument('--scale', choices=['lab', 'realistic'], default='lab',
+                         help='Preset de calibración (default: lab).')
     parser.add_argument('--seed', type=int, default=42, help='Semilla de reproducibilidad')
     parser.add_argument('--interval-seconds', type=int, default=REAL_CYCLE_INTERVAL_SECONDS,
-                         help=f'Segundos simulados entre ciclos (default: {REAL_CYCLE_INTERVAL_SECONDS}, '
-                              f'el intervalo real medido, no los 30s nominales de CYCLE_INTERVAL)')
+                         help=f'Segundos simulados entre ciclos (default: {REAL_CYCLE_INTERVAL_SECONDS})')
     parser.add_argument('--days-back', type=float, default=None,
-                         help='Si se especifica, el primer ciclo empieza hace N días (default: calculado '
-                              'automáticamente para que el último ciclo termine "ahora")')
+                         help='Si se especifica, el primer ciclo empieza hace N días')
     parser.add_argument('--csv-mirror', type=str, default=None,
                          help='Ruta opcional para guardar además un CSV espejo de las filas insertadas')
+
+    parser.add_argument('--events-per-week', type=float, default=None,
+                         help='Tasa objetivo de eventos/semana (default del preset "realistic": 2.5)')
+    parser.add_argument('--peak-hour-start', type=int, default=19,
+                         help='Hora de inicio del horario pico, 0-23 (default: 19 — supuesto)')
+    parser.add_argument('--peak-hour-duration', type=int, default=4,
+                         help='Duración del horario pico en horas (default: 4 — supuesto)')
+    parser.add_argument('--confirmation-cycles', type=int, default=None,
+                         help='Ciclos de confirmación sostenida (override del preset)')
+    parser.add_argument('--episode-probability', type=float, default=None,
+                         help='Override manual directo de la probabilidad por ciclo')
     args = parser.parse_args()
 
     if args.days_back is not None:
@@ -303,11 +392,16 @@ def main():
 
     generate(
         cycles=args.cycles,
-        episode_probability=args.episode_probability,
+        scale=args.scale,
         seed=args.seed,
         start_time=start_time,
         interval_seconds=args.interval_seconds,
         csv_mirror_path=args.csv_mirror,
+        events_per_week=args.events_per_week,
+        peak_hour_start=args.peak_hour_start,
+        peak_hour_duration=args.peak_hour_duration,
+        confirmation_cycles=args.confirmation_cycles,
+        episode_probability_override=args.episode_probability,
     )
 
 
