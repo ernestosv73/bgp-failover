@@ -706,8 +706,10 @@ class ScoringWeightOptimizer:
         for col in X.columns:
             if X[col].dtype == 'bool':
                 X[col] = X[col].astype(int)
-        # Mismo fix que en prepare_features: forzar numérico, ej. si algún
-        # valor llegó como None desde el caller.
+        # Mismo fix que en prepare_features: primero fillna(0) general (cubre
+        # NaN genuino en columnas ya float64, ej. z_score_loss1/2 cuando no
+        # hay pérdida), LUEGO forzar numérico en columnas que sigan en object.
+        X = X.fillna(0)
         object_cols = X.select_dtypes(include='object').columns.tolist()
         for col in object_cols:
             X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
