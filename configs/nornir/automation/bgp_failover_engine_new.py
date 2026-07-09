@@ -109,7 +109,7 @@ PEER_THRESHOLDS = {
 
 DNS_DESTINATIONS = {
     'DNS1': '2001:db8:8888::100',
-    'DNS2': '2001:db8:ffad::100',
+    'DNS2': '2001:db8:4444::100',
 }
 
 DNS_THRESHOLDS = {
@@ -891,6 +891,19 @@ class BGPFailoverEngine:
 
             if cycle_data['provider_changed']:
                 event = {
+                    # ⚠️ v2.7 fix: reutilizar EXPLÍCITAMENTE el mismo timestamp
+                    # de la métrica de este ciclo. Sin esto, el INSERT dinámico
+                    # omite la columna 'time' y TimescaleDB usa su default
+                    # (NOW() real del servidor) — en producción pasa
+                    # desapercibido porque "ahora" y "el ciclo" son casi el
+                    # mismo instante, pero en generación sintética (donde el
+                    # reloj se congela por ciclo) desincroniza completamente
+                    # los eventos del timeline simulado — todos quedan
+                    # timestamped con el momento REAL de ejecución del script,
+                    # no con el ciclo sintético que los originó. Esto rompía
+                    # provider_changes_last_hour/time_since_last_change_min en
+                    # feature_engine_incremental.py (siempre 0/NULL).
+                    'time': timestamp,
                     'previous_provider': cycle_data['previous_provider'],
                     'new_provider': cycle_data['new_provider'],
                     'change_reason': cycle_data['change_reason'],
