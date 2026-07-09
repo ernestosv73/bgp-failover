@@ -29,6 +29,13 @@ LÓGICA:
    primeras filas nuevas de cada corrida no arranquen "en frío", se traen
    también las TREND_WINDOW_LONG-1 filas anteriores al último timestamp
    procesado, se usan solo como contexto de cálculo, y NO se re-insertan.
+
+✅ v2.2 — cold-start real (ml_features vacía): en vez de limitarse a
+"últimas LAST_HOURS horas" (que dejaba afuera casi todo un dataset generado
+de una sola vez, ej. el generador sintético en escala 'realistic' con
+semanas/meses de datos), ahora lee bgp_metrics_new COMPLETA. No necesita
+ventana de contexto adicional en este modo — el dataset ya arranca desde el
+principio.
 """
 import psycopg2
 import pandas as pd
@@ -45,7 +52,10 @@ TIMESCALEDB_PASSWORD = 'bgp_app_password'
 
 # === Configuración de Feature Engine ===
 EXECUTION_MODE = "incremental"
-LAST_HOURS = 1
+# ✅ v2.2: LAST_HOURS eliminado — el cold-start (ml_features vacía) ahora lee
+# la tabla bgp_metrics_new COMPLETA en vez de una ventana de horas fija (ver
+# load_metrics_incremental). Necesario para datasets sintéticos generados de
+# una sola vez que pueden abarcar semanas/meses.
 
 # ✅ Ventanas de tendencia (Etapa 2) — distintas de la ventana de 3 ciclos del
 # motor en vivo (esa es de CONFIRMACIÓN de decisión; esta es de TENDENCIA para
@@ -122,7 +132,7 @@ class TimescaleDBClient:
             if result[0]:
                 logging.info(f"✅ Último timestamp en ml_features: {result[0]}")
                 return result[0]
-            logging.info("ℹ️ ml_features vacía, procesará últimas horas")
+            logging.info("ℹ️ ml_features vacía, se procesará la tabla bgp_metrics_new completa")
             return None
         except Exception as e:
             logging.error(f"⚠️ Error leyendo last_timestamp: {e}")
@@ -166,22 +176,29 @@ class FeatureEngineV2:
     # ------------------------------------------------------------------
     def load_metrics_incremental(self):
         """
-        Carga los datos nuevos desde bgp_metrics_new, más TREND_WINDOW_LONG-1
-        filas previas como contexto histórico para que las rolling stats de
-        las primeras filas nuevas no arranquen sin ventana. Las filas de
-        contexto se identifican con `is_context=True` y no se insertan.
+        Carga los datos desde bgp_metrics_new. Dos modos:
+
+        1. COLD START (ml_features vacía, last_timestamp=None): lee la tabla
+           COMPLETA, sin filtro de tiempo. Necesario para datasets generados
+           de una sola vez que pueden abarcar semanas/meses (ej. el generador
+           sintético en modo 'realistic') — el viejo comportamiento de
+           "últimas LAST_HOURS horas" dejaba afuera prácticamente todo el
+           dataset en ese escenario. No hace falta ventana de contexto en
+           este modo: el dataset ya arranca desde el principio, y las
+           rolling stats de las primeras filas simplemente tienen menos
+           historia disponible (min_periods=3 ya lo maneja sin arrancar
+           en frío con NaN).
+
+        2. INCREMENTAL (ya hay checkpoint en ml_features): comportamiento
+           sin cambios — trae solo lo nuevo desde el último timestamp
+           procesado, más TREND_WINDOW_LONG-1 filas previas como contexto
+           para que las rolling stats de las primeras filas nuevas del
+           batch no arranquen sin ventana.
         """
         last_timestamp = self.ts_client.get_last_feature_timestamp()
+        is_cold_start = last_timestamp is None
 
-        if last_timestamp is None:
-            time_filter = f"NOW() - INTERVAL '{LAST_HOURS} hours'"
-            logging.info(f"📥 Primera ejecución: cargando últimas {LAST_HOURS} horas...")
-        else:
-            time_filter = f"'{last_timestamp}'::timestamptz"
-            logging.info(f"📥 Cargando datos después de: {last_timestamp}")
-
-        query = f"""
-            SELECT
+        base_select = """
                 time, cycle_number, current_provider AS provider,
                 peer_latency_ms, peer_jitter_ms, peer_loss_pct,
                 dns1_latency_ms, dns1_jitter_ms, dns1_loss_pct,
@@ -192,10 +209,25 @@ class FeatureEngineV2:
                 severity_multiplier_dns1, severity_multiplier_dns2,
                 score_dns1, score_dns2, max_score,
                 quality_status, degradation_cycle, provider_changed, decision
-            FROM bgp_metrics_new
-            WHERE time > {time_filter}
-            ORDER BY time
         """
+
+        if is_cold_start:
+            logging.info("📥 Primera ejecución (ml_features vacía): cargando la tabla COMPLETA bgp_metrics_new...")
+            query = f"""
+                SELECT {base_select}
+                FROM bgp_metrics_new
+                ORDER BY time
+            """
+        else:
+            time_filter = f"'{last_timestamp}'::timestamptz"
+            logging.info(f"📥 Cargando datos después de: {last_timestamp}")
+            query = f"""
+                SELECT {base_select}
+                FROM bgp_metrics_new
+                WHERE time > {time_filter}
+                ORDER BY time
+            """
+
         try:
             df_new = pd.read_sql(query, self.conn)
             # ✅ Fix: con conexión psycopg2 "cruda" (no SQLAlchemy), pd.read_sql
@@ -208,44 +240,48 @@ class FeatureEngineV2:
             return pd.DataFrame()
 
         if df_new.empty:
-            logging.info("ℹ️ No hay nuevos datos desde última ejecución")
+            logging.info("ℹ️ No hay datos en bgp_metrics_new para procesar")
             return df_new
 
         df_new['is_context'] = False
-        logging.info(f"✅ Cargados {len(df_new)} registros nuevos")
 
-        # ✅ Ventana de contexto: últimas TREND_WINDOW_LONG-1 filas ANTES del
-        # primer registro nuevo, para que rolling/z-score/CV no arranquen en frío.
-        context_needed = TREND_WINDOW_LONG - 1
-        if context_needed > 0:
-            first_new_time = df_new['time'].min()
-            context_query = f"""
-                SELECT
-                    time, cycle_number, current_provider AS provider,
-                    peer_latency_ms, peer_jitter_ms, peer_loss_pct,
-                    dns1_latency_ms, dns1_jitter_ms, dns1_loss_pct,
-                    dns2_latency_ms, dns2_jitter_ms, dns2_loss_pct,
-                    peer_norm, dns1_norm, dns2_norm, jitter1_norm, jitter2_norm,
-                    loss1_norm, loss2_norm,
-                    base_score_dns1, base_score_dns2,
-                    severity_multiplier_dns1, severity_multiplier_dns2,
-                    score_dns1, score_dns2, max_score,
-                    quality_status, degradation_cycle, provider_changed, decision
-                FROM bgp_metrics_new
-                WHERE time < '{first_new_time}'::timestamptz
-                ORDER BY time DESC
-                LIMIT {context_needed}
-            """
-            try:
-                df_context = pd.read_sql(context_query, self.conn)
-                df_context['time'] = pd.to_datetime(df_context['time'], utc=True)
-                df_context['is_context'] = True
-                logging.info(f"📎 Contexto histórico agregado: {len(df_context)} filas previas (no se insertan)")
-            except Exception as e:
-                logging.warning(f"⚠️ No se pudo cargar contexto histórico: {e}")
-                df_context = pd.DataFrame()
-        else:
+        if is_cold_start:
+            logging.info(f"✅ Cargados {len(df_new)} registros (tabla completa)")
+            if len(df_new) > 200_000:
+                logging.warning(
+                    f"⚠️ {len(df_new)} filas es un volumen considerable para procesar en memoria "
+                    f"de una sola vez. Si esto se vuelve un problema de rendimiento/memoria, "
+                    f"considerar procesar por bloques de tiempo en vez de la tabla completa."
+                )
+            # Sin ventana de contexto: el dataset ya arranca desde el
+            # principio, no hay nada "antes" que traer.
             df_context = pd.DataFrame()
+        else:
+            logging.info(f"✅ Cargados {len(df_new)} registros nuevos")
+
+            # ✅ Ventana de contexto: últimas TREND_WINDOW_LONG-1 filas ANTES
+            # del primer registro nuevo, para que rolling/z-score/CV no
+            # arranquen en frío.
+            context_needed = TREND_WINDOW_LONG - 1
+            if context_needed > 0:
+                first_new_time = df_new['time'].min()
+                context_query = f"""
+                    SELECT {base_select}
+                    FROM bgp_metrics_new
+                    WHERE time < '{first_new_time}'::timestamptz
+                    ORDER BY time DESC
+                    LIMIT {context_needed}
+                """
+                try:
+                    df_context = pd.read_sql(context_query, self.conn)
+                    df_context['time'] = pd.to_datetime(df_context['time'], utc=True)
+                    df_context['is_context'] = True
+                    logging.info(f"📎 Contexto histórico agregado: {len(df_context)} filas previas (no se insertan)")
+                except Exception as e:
+                    logging.warning(f"⚠️ No se pudo cargar contexto histórico: {e}")
+                    df_context = pd.DataFrame()
+            else:
+                df_context = pd.DataFrame()
 
         df = pd.concat([df_context, df_new], ignore_index=True).sort_values('time').reset_index(drop=True)
         return df
