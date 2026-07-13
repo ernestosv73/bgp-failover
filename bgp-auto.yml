@@ -79,8 +79,8 @@ topology:
        - python3 -m pip config set global.break-system-packages true
        - chmod +x /root/nornir.sh
        - bash /root/nornir.sh    
-       #- ip -6 address add 2001:db8:ca01::100/64 dev eth1 
-       #- ip -6 route add default via 2001:db8:ca01::1
+       - ip -6 address add 2001:db8:ca01::100/64 dev eth1 
+       - ip -6 route add default via 2001:db8:ca01::1
 
     ianetops:
       kind: linux
@@ -115,20 +115,20 @@ topology:
         #GF_AUTH_OAUTH_AUTO_LOGIN: "true"
         
      
-    elastic:
-      kind: linux
-      mgmt-ipv4: 172.90.90.9
-      image: docker.elastic.co/elasticsearch/elasticsearch:7.17.7
+    #elastic:
+      #kind: linux
+      #mgmt-ipv4: 172.90.90.9
+      #image: docker.elastic.co/elasticsearch/elasticsearch:7.17.7
       
-      env:
-        node.name: es01
-        discovery.type: single-node
+      #env:
+        #node.name: es01
+        #discovery.type: single-node
         #xpack.security.enabled: "true"
         #xpack.security.audit.enabled: "true"
         #xpack.security.authc.api_key.enabled: "true"
-        ES_JAVA_OPTS: "-Xms1g -Xmx1g"
-      ports:
-        - 9200:9200/tcp   
+        #ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      #ports:
+        #- 9200:9200/tcp   
    
   links:
     - endpoints: ["rt-provider1:e1-1", "rt-core:eth1"]
