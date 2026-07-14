@@ -66,10 +66,17 @@ logger = logging.getLogger(__name__)
 
 # ── Configuración de captura real (MTR) ─────────────────────────────────
 MTR_CONFIG = {'count': 5, 'timeout': 30, 'packet_size': 64, 'interval': 0.5}
-IP_VERSION = '6'
-DNS_DESTINATIONS = {
+
+# ✅ Defaults — la topología Containerlab del proyecto. Configurable vía CLI
+# (--dns1-destination/--dns2-destination/--ip-version) para poder apuntar a
+# destinos reales de Internet (ej. resolutores públicos 8.8.8.8/1.1.1.1,
+# IPv4) y capturar tráfico real desde un host cualquiera — ver conversación
+# sobre calibrar el generador sintético (Ornstein-Uhlenbeck) contra
+# mediciones reales, igual que hace el paper con sus kernels de GP.
+DEFAULT_IP_VERSION = '6'
+DEFAULT_DNS_DESTINATIONS = {
     'dns1': '2001:db8:8888::100',
-    'dns2': '2001:db8:ffad::100',
+    'dns2': '2001:db8:4444::100',
 }
 
 GROUND_TRUTH_FLUSH_EVERY_CYCLES = 500
@@ -170,10 +177,10 @@ def insert_ground_truth_batch(conn, rows):
 # Modo REAL — MTR contra la topología
 # ════════════════════════════════════════════════════════════════════════
 
-def run_mtr(destination):
+def run_mtr(destination, ip_version):
     try:
         cmd = [
-            'mtr', f'-{IP_VERSION}', '-n', '-j',
+            'mtr', f'-{ip_version}', '-n', '-j',
             '-c', str(MTR_CONFIG['count']),
             '-s', str(MTR_CONFIG['packet_size']),
             '-i', str(MTR_CONFIG['interval']),
@@ -209,11 +216,11 @@ def extract_last_hop(mtr_report, destination_ip):
         return None
 
 
-def run_real_capture(conn, cycles, interval_seconds):
+def run_real_capture(conn, cycles, interval_seconds, dns_destinations, ip_version):
     cycle_number = get_last_cycle_number(conn) + 1
     logger.info("=" * 80)
     logger.info(f"📡 Captura REAL — {cycles} ciclos, cadencia objetivo {interval_seconds}s")
-    logger.info(f"   DNS1: {DNS_DESTINATIONS['dns1']} | DNS2: {DNS_DESTINATIONS['dns2']}")
+    logger.info(f"   DNS1: {dns_destinations['dns1']} | DNS2: {dns_destinations['dns2']} | IPv{ip_version}")
     logger.info(f"   cycle_number inicial (continúa desde BD): {cycle_number}")
     logger.info("=" * 80)
 
@@ -221,10 +228,10 @@ def run_real_capture(conn, cycles, interval_seconds):
     for i in range(cycles):
         t0 = time.time()
 
-        mtr1 = run_mtr(DNS_DESTINATIONS['dns1'])
-        m1 = extract_last_hop(mtr1, DNS_DESTINATIONS['dns1']) if mtr1 else None
-        mtr2 = run_mtr(DNS_DESTINATIONS['dns2'])
-        m2 = extract_last_hop(mtr2, DNS_DESTINATIONS['dns2']) if mtr2 else None
+        mtr1 = run_mtr(dns_destinations['dns1'], ip_version)
+        m1 = extract_last_hop(mtr1, dns_destinations['dns1']) if mtr1 else None
+        mtr2 = run_mtr(dns_destinations['dns2'], ip_version)
+        m2 = extract_last_hop(mtr2, dns_destinations['dns2']) if mtr2 else None
 
         if m1 is None or m2 is None:
             logger.warning(f"⚠️ Ciclo {cycle_number} incompleto — se omite (no se inserta fila parcial)")
@@ -369,6 +376,18 @@ def main():
     parser.add_argument('--db-user', default='bgp_app')
     parser.add_argument('--db-password', default='bgp_app_password')
 
+    # Solo modo real
+    parser.add_argument('--dns1-destination', type=str, default=DEFAULT_DNS_DESTINATIONS['dns1'],
+                         help=f'IP/host de destino para "dns1" (default: topología Containerlab, '
+                              f'{DEFAULT_DNS_DESTINATIONS["dns1"]}). Para captura real de Internet, ej. '
+                              f'8.8.8.8 (Google) o 1.1.1.1 (Cloudflare) — ajustar --ip-version a 4.')
+    parser.add_argument('--dns2-destination', type=str, default=DEFAULT_DNS_DESTINATIONS['dns2'],
+                         help=f'IP/host de destino para "dns2" (default: topología Containerlab, '
+                              f'{DEFAULT_DNS_DESTINATIONS["dns2"]}). Ej. real: 8.8.4.4 o 1.0.0.1.')
+    parser.add_argument('--ip-version', choices=['4', '6'], default=DEFAULT_IP_VERSION,
+                         help=f'Versión IP para MTR (default: {DEFAULT_IP_VERSION}, la topología Containerlab '
+                              f'usa IPv6). Usar 4 para destinos públicos de Internet como 8.8.8.8.')
+
     # Solo modo synthetic
     parser.add_argument('--scale', choices=['lab', 'realistic'], default='lab')
     parser.add_argument('--seed', type=int, default=42)
@@ -389,7 +408,8 @@ def main():
     conn = get_connection(args.db_host, args.db_port, args.db_name, args.db_user, args.db_password)
 
     if args.mode == 'real':
-        run_real_capture(conn, args.cycles, args.interval_seconds)
+        dns_destinations = {'dns1': args.dns1_destination, 'dns2': args.dns2_destination}
+        run_real_capture(conn, args.cycles, args.interval_seconds, dns_destinations, args.ip_version)
     else:
         random.seed(args.seed)
 
