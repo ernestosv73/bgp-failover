@@ -79,8 +79,8 @@ topology:
        - python3 -m pip config set global.break-system-packages true
        - chmod +x /root/nornir.sh
        - bash /root/nornir.sh    
-       - ip -6 address add 2001:db8:ca01::100/64 dev eth1 
-       - ip -6 route add default via 2001:db8:ca01::1
+       #- ip -6 address add 2001:db8:ca01::100/64 dev eth1 
+       #- ip -6 route add default via 2001:db8:ca01::1
 
     ianetops:
       kind: linux
