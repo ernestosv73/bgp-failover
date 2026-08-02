@@ -125,7 +125,7 @@ topology:
       #ports:
         #- 9200:9200/tcp   
    
-   links:
+  links:
     - endpoints: ["rt-provider1:e1-1", "rt-core:e1-1"]
     - endpoints: ["rt-provider2:e1-1", "rt-core:e1-2"]
     - endpoints: ["rt-provider1:e1-2", "rt-transit:e1-1"]
