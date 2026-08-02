@@ -56,8 +56,8 @@ except ImportError:
     # Configuración por defecto
     MTR_CONFIG = {'count': 5, 'timeout': 30, 'packet_size': 64, 'interval': 0.5}
     PEER_IPS = {
-        'PROVIDER1': '2001:db8:ffaa::255',
-        'PROVIDER2': '2001:db8:ffac::255'
+        'PROVIDER1': '2001:db8:1::2',
+        'PROVIDER2': '2001:db8:2::2'
     }
     IP_VERSIONS = {'PROVIDER1': '6', 'PROVIDER2': '6'}
     PROVIDERS = ['PROVIDER1', 'PROVIDER2']
