@@ -830,7 +830,7 @@ class BGPFailoverEngine:
                 'peer_ip': self.provider_peer_ip_map.get('PROVIDER1', ''),
                 'peer_asn': self.provider_asn_map.get('PROVIDER1'),
                 'cycle_number': self.cycle_count,
-                'host': 'core-router-huawei',
+                'host': 'core-router',
 
                 # Métricas crudas
                 'peer_latency_ms': round(metrics.peer_avg, 2),
