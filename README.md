@@ -40,17 +40,19 @@ The repository deploys and integrates:
 
 ```
 .
-├── bgp-auto.yml                     # Containerlab topology definition
-├── docker-compose.yml               # TimescaleDB + pgAdmin
-├── create_database_schema.sql       # Full DB schema (tables, roles, permissions)
-├── configs/nornir/automation/timescaledb_client.py            # DB access layer
-├── bgp_failover_engine_new.py       # Failover engine
-├── feature_engine_incremental.py    # Feature derivation (Etapa 1 + Etapa 2)
-├── synthetic_data_generator.py      # Synthetic dataset generator
-├── xgboost_optimizer.py             # XGBoost training/optimization
-├── logistic_regression_optimizer.py # Logistic Regression training/optimization
-├── train_from_ml_features.py        # XGBoost training entry point
-└── train_logistic_regression.py     # Combined XGBoost + Logistic Regression comparison
+├── bgp-auto.yml                                               # Containerlab topology definition
+├── docker-compose.yml                                         # TimescaleDB + pgAdmin
+├── create_database_schema.sql                                 # Full DB schema (tables, roles, permissions)
+├── configs/nornir/automation/
+                              ├── timescaledb_client.py        # DB access layer
+                              ├── bgp_failover_engine_new.py   # Failover engine
+                              ├── synthetic_data_generator.py  # Synthetic dataset generator
+├── scripts/
+            ├── feature_engine_incremental.py                  # Feature derivation (Etapa 1 + Etapa 2)
+            ├── xgboost_optimizer.py                           # XGBoost training/optimization
+            ├── logistic_regression_optimizer.py               # Logistic Regression training/optimization
+            ├── train_from_ml_features.py                      # XGBoost training entry point
+            └── train_logistic_regression.py                   # Combined XGBoost + Logistic Regression comparison
 ```
 
 ---
