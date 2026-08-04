@@ -74,7 +74,7 @@ The repository deploys and integrates:
 - [Containerlab](https://containerlab.dev/)
 - Python 3.10+ with `psycopg2`, `pandas`, `numpy`, `xgboost`, `scikit-learn`, `optuna`
 - `mtr` installed inside the monitor node's container image
-- (Optional) [Containerlab extension for Visual Studio Code](https://marketplace.visualstudio.com/items?itemName=srl-labs.vscode-containerlab), used to simulate link degradation interactively
+- (Optional) [Containerlab extension for Visual Studio Code](https://containerlab.dev/manual/gui/), used to simulate link degradation interactively
 
 ---
 
@@ -157,5 +157,11 @@ python3 train_from_ml_features.py
 Runs Bayesian hyperparameter optimization and 5-fold cross-validation on XGBoost, reporting feature importance and candidate scoring weights. Use `train_logistic_regression.py` to additionally train Logistic Regression and compare both sets of candidate weights side by side against the current formula.
 
 ---
+## References
 
+- IETF Draft, *BGP Performance-aware Routing Mechanism*
+- Databricks Engineering Blog, *Detecting Anomalies in Network Latency Time Series: From Statistical Filters to Machine Learning*
+- FCC broadband measurement methodology, *Where Has the Time Gone? Examining Over a Decade of Broadband Latency Measurements*
+
+This work was developed as part of a technical presentation on AI-driven Network Operations (AI-NetOps) applied to BGP failover automation.
 This project is licensed under the terms of the [MIT](LICENSE).
