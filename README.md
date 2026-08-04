@@ -43,7 +43,7 @@ The repository deploys and integrates:
 ├── bgp-auto.yml                     # Containerlab topology definition
 ├── docker-compose.yml               # TimescaleDB + pgAdmin
 ├── create_database_schema.sql       # Full DB schema (tables, roles, permissions)
-├── timescaledb_client.py            # DB access layer
+├── configs/nornir/automation/timescaledb_client.py            # DB access layer
 ├── bgp_failover_engine_new.py       # Failover engine
 ├── feature_engine_incremental.py    # Feature derivation (Etapa 1 + Etapa 2)
 ├── synthetic_data_generator.py      # Synthetic dataset generator
