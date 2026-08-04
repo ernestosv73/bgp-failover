@@ -63,10 +63,9 @@ The repository deploys and integrates:
 
 ### 🔍 Architecture Highlights:
 - **Dual WAN Uplinks**: Provider1 & Provider2 with independent BGP sessions
-- **Core Router**: Huawei device managed via SSH through Nornir
-- **Automation Plane**: NetBox → GitLab CI/CD → Nornir → Router
-- **Telemetry Plane**: MTR → BGP Failover Script → Elasticsearch → Grafana
-
+- **Core Router**: Nokia SR Linux 24.10 device 
+- **Capture and Datastore Plane**: MTR → BGP Failover Script → Timescaledb
+- **IA ML Plane**: ianetops
 ---
 ## Prerequisites
 
