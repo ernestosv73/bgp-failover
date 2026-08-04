@@ -1,4 +1,4 @@
-# 🚀 Containerlab Laboratory: BGP Routing Policies Automation & Telemetry
+# 🚀 Containerlab Laboratory: BGP Route Selection Based on Latency — An Intelligent Failover Engine Optimized with Supervised Learning
 
 > A simulated ISP network environment with automated BGP policy failover based on real-time link quality metrics.
 
@@ -8,12 +8,14 @@
 
 ## 📋 Summary
 
-This laboratory simulates an Internet Service Provider (ISP) network environment with two WAN uplinks (**Provider1** and **Provider2**). It deploys:
+This laboratory simulates an Internet Service Provider (ISP) network environment with two redundant WAN uplinks (**Provider1** and **Provider2**), used to design, test, and validate an intelligent BGP failover mechanism driven by continuous latency, jitter, and packet loss measurements — rather than static, manually configured routing policies.
 
-- 🔧 An **Automation Framework** for dynamic BGP routing policy updates
-- 📊 A **Telemetry Stack** for real-time observability of link quality with upstream providers
+The repository deploys and integrates:
 
-✅ **Key Benefit**: The proposed solution enables **automatic BGP routing policy failover** driven by network quality metrics (latency, jitter, packet loss).
+- **A continuous monitoring and BGP failover framework** — orchestrates active measurements (MTR) toward the upstream peer and two DNS reference targets, computes a weighted health score per cycle, and automatically decides when to fail over to the standby provider or return to the primary one.
+- **A supervised learning framework** — derives time-windowed statistical features (z-score, coefficient of variation, p95 deviation, trend/velocity/acceleration) from the historical metrics, and trains XGBoost and Logistic Regression models to estimate the relative importance of each metric and propose data-driven weights for the scoring formula.
+- **TimescaleDB** — the time-series datastore for raw metrics, derived features, and failover event history, with **pgAdmin** for inspection.
+- **Supporting scripts** for synthetic dataset generation, calibrated against real-world ISP operating parameters, to complement the historical data captured directly from the lab topology.
 
 ---
 
