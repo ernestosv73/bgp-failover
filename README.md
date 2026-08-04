@@ -21,13 +21,18 @@ The repository deploys and integrates:
 
 ## 🏗️ Proposed Solution Architecture
 
-### 🤖 Automation Framework
-
-| Component | Role | Key Features |
-|-----------|------|-------------|
-| **NetBox** | Single Source of Truth (SSoT) | • BGP policy modeling with custom fields<br>• RESTful API for external integrations<br>• Webhooks to trigger automation events<br>🔗 [netboxlabs.com](https://netboxlabs.com/) |
-| **GitLab CI/CD** | Configuration Pipeline | • Automated pipeline for BGP policy changes<br>• GitLab Runner as configuration deployment executor<br>🔗 [gitlab.com](https://gitlab.com/) |
-| **Nornir** | Automation Orchestrator | • Multi-vendor, multi-platform task orchestration<br>• Integrated with GitLab Runner for secure access to Huawei core routers<br>🔗 [nornir.readthedocs.io](https://nornir.readthedocs.io/en/latest/#) |
+| Component | Role | Key Feature |
+|---|---|---|
+| Containerlab topology | Virtualized ISP network: core router, transit router, two upstream providers, and two DNS targets (via Google/Cloudflare-style resolvers) | Reproducible, redundant dual-uplink topology on a Nokia SR Linux core |
+| `nornir` (monitor node) | Runs the failover engine and captures live measurements | Executes MTR toward the peer and both DNS targets every cycle |
+| `ianetops` (automation node) | Runs the feature engineering and model training pipeline | Independent of the live failover decision loop |
+| TimescaleDB | Central time-series datastore | Hypertables for `bgp_metrics_new`, `bgp_failover_events`, `ml_features` |
+| `bgp_failover_engine_new.py` | Failover engine | Weighted scoring, sustained-degradation confirmation, individual-metric breach detection, safety bypass |
+| `timescaledb_client.py` | Database access layer | Dynamic, schema-agnostic inserts; sanitizes numpy/NaN types |
+| `feature_engine_incremental.py` | Feature derivation | Rolling-window statistical features (Etapa 1 + Etapa 2); incremental with cold-start support |
+| `synthetic_data_generator.py` | Synthetic dataset generator | Reuses the real engine's decision logic; five calibrated anomaly waveforms (step, spike, unstable, oscillating, slow-increase) |
+| `xgboost_optimizer.py` / `logistic_regression_optimizer.py` | Model training | Feature importance ranking (XGBoost) and interpretable linear coefficients (Logistic Regression) |
+| `train_from_ml_features.py` / `train_logistic_regression.py` | Training orchestration | Cross-validated evaluation, candidate weight extraction |
 
 ---
 
