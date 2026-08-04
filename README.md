@@ -36,16 +36,22 @@ The repository deploys and integrates:
 
 ---
 
-## 🔄 Architecture Diagram
+## Repository Structure
 
-
-## 📡 Telemetry Stack
-
-| Component | Role | Key Features |
-|-----------|------|-------------|
-| **MTR (Matt's Traceroute)** | Link Quality Diagnostics | • Real-time monitoring of latency, jitter, and packet loss<br>• BGP peer path analysis<br>• Integrated with BGP Failover Script for automated decision-making<br>🔗 [github.com/traviscross/mtr](https://github.com/traviscross/mtr) |
-| **Elasticsearch** | Telemetry Data Backend | • Automatic indexing and storage of telemetry events<br>• High-performance search and aggregation for time-series metrics<br>• Receives data from BGP Failover Script via HTTP/REST<br>🔗 [elastic.co/elasticsearch](https://www.elastic.co/es/elasticsearch) |
-| **Grafana** | Visualization & Dashboards | • Dynamic panels for BGP peer latency metrics<br>• Real-time link change tracking and alerting<br>• Elasticsearch as native datasource for powerful queries<br>🔗 [grafana.com](https://grafana.com/) |
+```
+.
+├── bgp-auto.yml                     # Containerlab topology definition
+├── docker-compose.yml               # TimescaleDB + pgAdmin
+├── create_database_schema.sql       # Full DB schema (tables, roles, permissions)
+├── timescaledb_client.py            # DB access layer
+├── bgp_failover_engine_new.py       # Failover engine
+├── feature_engine_incremental.py    # Feature derivation (Etapa 1 + Etapa 2)
+├── synthetic_data_generator.py      # Synthetic dataset generator
+├── xgboost_optimizer.py             # XGBoost training/optimization
+├── logistic_regression_optimizer.py # Logistic Regression training/optimization
+├── train_from_ml_features.py        # XGBoost training entry point
+└── train_logistic_regression.py     # Combined XGBoost + Logistic Regression comparison
+```
 
 ---
 
