@@ -1,0 +1,61 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.27.2-pg17
+    container_name: timescale-db
+    restart: unless-stopped
+
+    ports:
+      - "5432:5432"
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: bgp_failover_db
+      TIMESCALEDB_TELEMETRY: off
+
+    volumes:
+      - /opt/timescaledb/data:/var/lib/postgresql/data
+
+    shm_size: "1gb"
+
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=256MB
+      -c max_connections=200
+      -c effective_cache_size=2GB
+
+    networks:
+      isp-bgp:
+        ipv4_address: 172.90.90.100
+
+  pgadmin:
+    image: dpage/pgadmin4:9.8
+    container_name: pgadmin
+    restart: unless-stopped
+
+    ports:
+      - "5050:80"
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+
+    volumes:
+      - /opt/pgadmin/data:/var/lib/pgadmin
+
+    depends_on:
+      - timescaledb
+
+    networks:
+      isp-bgp:
+        ipv4_address: 172.90.90.101
+
+networks:
+  isp-bgp:
+    external: true
+
+     
