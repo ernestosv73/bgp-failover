@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def load_training_data_from_ml_features(
     timescaledb_password,
-    days=30,
+    days=None,
     timescaledb_host='timescaledb',
     timescaledb_port=5432,
     timescaledb_db='bgp_failover_db',
@@ -28,8 +28,17 @@ def load_training_data_from_ml_features(
 ):
     """
     Carga datos de entrenamiento desde ml_features (schema real, post v2).
+
+    days=None (default) -> sin filtro de tiempo, trae TODA la tabla. Antes
+    el default era 30, hardcodeado — con datasets sintéticos que ya superan
+    varias semanas (ej. 7+ semanas con 100,000 ciclos), ese límite dejaba
+    afuera silenciosamente la mayoría de los datos disponibles. Pasar un
+    entero explícito si se quiere acotar a los últimos N días.
     """
-    logger.info(f"📥 Cargando hasta {days} días de datos de ml_features...")
+    if days is not None:
+        logger.info(f"📥 Cargando hasta {days} días de datos de ml_features...")
+    else:
+        logger.info(f"📥 Cargando TODA la tabla ml_features (sin límite de fecha)...")
 
     conn = psycopg2.connect(
         host=timescaledb_host, port=timescaledb_port, database=timescaledb_db,
@@ -55,6 +64,12 @@ def load_training_data_from_ml_features(
         severity_multiplier_dns1, severity_multiplier_dns2,
         score_dns1, score_dns2, max_score, quality_status,
         -- Temporales/estadísticas (Etapa 2)
+        -- ⚠️ z_score_peer/cv_peer/p95_dev_peer/z_deriv_peer/latency_*_peer
+        -- (sin sufijo) son las versiones AMBIGUAS anteriores a v2.3 — siguen
+        -- cargándose por si hay filas históricas viejas, pero
+        -- xgboost_optimizer.prepare_features() las excluye del entrenamiento
+        -- (ver AMBIGUOUS_FEATURES). Las que sí se usan son las *_active/
+        -- *_standby de más abajo.
         z_score_peer, z_score_dns1, z_score_dns2,
         z_score_jitter1, z_score_jitter2, z_score_loss1, z_score_loss2,
         cv_peer, cv_dns1, cv_dns2,
@@ -75,8 +90,8 @@ def load_training_data_from_ml_features(
         -- Target
         target_decision
     FROM ml_features
-    WHERE time >= NOW() - INTERVAL '{days} days'
-      AND target_decision IS NOT NULL
+    WHERE target_decision IS NOT NULL
+    {f"AND time >= NOW() - INTERVAL '{days} days'" if days is not None else ""}
     ORDER BY time
     """
 
@@ -121,7 +136,13 @@ def load_training_data_from_ml_features(
 
 
 def main():
+    import argparse
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    parser = argparse.ArgumentParser(description='Entrena XGBoost multiclase desde ml_features')
+    parser.add_argument('--days', type=int, default=None,
+                         help='Límite de días hacia atrás (default: None = toda la tabla, sin límite)')
+    args = parser.parse_args()
 
     print("=" * 80)
     print("🚀 ENTRENAMIENTO XGBoost MULTICLASE — Opción A (ml_features real)")
@@ -132,7 +153,7 @@ def main():
     print("-" * 80)
     df = load_training_data_from_ml_features(
         timescaledb_password='bgp_app_password',
-        days=30
+        days=args.days
     )
     if df.empty:
         print("❌ Sin datos — abortando.")
