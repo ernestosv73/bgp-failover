@@ -41,7 +41,13 @@ def print_comparison_table(current, xgb_weights, lr_weights_failover, lr_weights
 
 
 def main():
+    import argparse
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    parser = argparse.ArgumentParser(description='Opción B completa: XGBoost + Logistic Regression desde ml_features')
+    parser.add_argument('--days', type=int, default=None,
+                         help='Límite de días hacia atrás (default: None = toda la tabla, sin límite)')
+    args = parser.parse_args()
 
     print("=" * 80)
     print("🚀 OPCIÓN B COMPLETA — XGBoost (ranking) + Logistic Regression (coeficientes)")
@@ -49,7 +55,7 @@ def main():
 
     print("\nPASO 1: Cargar datos de ml_features")
     print("-" * 80)
-    df = load_training_data_from_ml_features(timescaledb_password='bgp_app_password', days=30)
+    df = load_training_data_from_ml_features(timescaledb_password='bgp_app_password', days=args.days)
     if df.empty:
         print("❌ Sin datos — abortando.")
         return
