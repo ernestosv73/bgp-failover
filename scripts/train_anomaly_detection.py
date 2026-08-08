@@ -231,7 +231,8 @@ def load_long_format_dataset(timescaledb_password, days=None,
     conn.close()
 
     if wide.empty or gt.empty:
-        logger.warning("⚠️ ml_features o anomaly_ground_truth están vacías")
+        logger.warning(f"⚠️ link_health_features ({len(wide)} filas) o "
+                        f"link_health_ground_truth ({len(gt)} filas) están vacías")
         return pd.DataFrame()
 
     logger.info(f"✅ link_health_features: {len(wide)} ciclos | link_health_ground_truth: {len(gt)} filas")
