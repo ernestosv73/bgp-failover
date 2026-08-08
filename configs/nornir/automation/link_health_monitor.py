@@ -75,8 +75,8 @@ MTR_CONFIG = {'count': 5, 'timeout': 30, 'packet_size': 64, 'interval': 0.5}
 # mediciones reales, igual que hace el paper con sus kernels de GP.
 DEFAULT_IP_VERSION = '6'
 DEFAULT_DNS_DESTINATIONS = {
-    'dns1': '2001:db8:8888::100',
-    'dns2': '2001:db8:4444::100',
+    'dns1': '2001:db8:700::53',
+    'dns2': '2001:db8:800::53',
 }
 
 GROUND_TRUTH_FLUSH_EVERY_CYCLES = 500
