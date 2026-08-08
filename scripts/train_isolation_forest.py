@@ -192,7 +192,11 @@ def main():
 
     print("\nPASO 1: Cargar dataset (mismo formato largo que train_anomaly_detection.py)")
     print("-" * 80)
-    df = load_long_format_dataset(timescaledb_password='bgp_app_password', days=args.days)
+    df = load_long_format_dataset(
+        timescaledb_password=args.db_password, days=args.days,
+        timescaledb_host=args.db_host, timescaledb_port=args.db_port,
+        timescaledb_db=args.db_name, timescaledb_user=args.db_user,
+    )
     if df.empty:
         print("❌ Sin datos — abortando. ¿Corriste link_health_monitor.py --mode synthetic "
               "y link_health_feature_engine.py?")
