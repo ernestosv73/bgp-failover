@@ -3,3 +3,4 @@ TRUNCATE TABLE link_health_ground_truth CASCADE;
 TRUNCATE TABLE link_health_features CASCADE;
 TRUNCATE TABLE link_health_metrics_enriched CASCADE;
 TRUNCATE TABLE link_health_changepoints CASCADE;
+TRUNCATE TABLE link_health_metrics_ml_results CASCADE;
