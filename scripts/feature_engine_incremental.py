@@ -36,6 +36,14 @@ de una sola vez, ej. el generador sintético en escala 'realistic' con
 semanas/meses de datos), ahora lee bgp_metrics_new COMPLETA. No necesita
 ventana de contexto adicional en este modo — el dataset ya arranca desde el
 principio.
+
+✅ v2.3 — split activo/standby de TODAS las features de 'peer' (raw + z-score
++ CV + p95_dev + z_deriv + tendencia/velocidad/aceleración). El motor mide
+SIEMPRE el peer de PROVIDER1, así que 'peer_latency_ms' (y todo lo derivado
+de ella) mezclaba dos contextos con semántica distinta: "salud del enlace en
+uso" (provider=PROVIDER1) vs. "salud del candidato de retorno"
+(provider=PROVIDER2). Un modelo lineal no puede separar esa ambigüedad con
+un solo coeficiente — ver calculate_peer_context_split_features().
 """
 import psycopg2
 import pandas as pd
@@ -86,6 +94,19 @@ LOSS_SPIKE_THRESHOLD_PCT = 5.0
 #                            qué patrón temporal antecede a un failover típico.
 EXCLUDED_DECISIONS = ('error', 'failover_inmediato')
 
+# ✅ v2.3 — 'peer' se maneja APARTE en calculate_peer_context_split_features(),
+# no en estas listas genéricas. Motivo: el motor mide SIEMPRE el peer de
+# PROVIDER1, sin importar cuál sea el proveedor activo (ver v2.6 del motor).
+# Una rolling window POSICIONAL (últimas N filas) sobre 'peer_latency_ms'
+# mezcla, sin distinguirlas, lecturas tomadas mientras PROVIDER1 estaba
+# activo con lecturas tomadas mientras estaba en standby — dos contextos con
+# semántica distinta ("salud del enlace en uso" vs. "salud del candidato de
+# retorno"). Un modelo lineal (Logistic Regression) ni siquiera puede
+# aprender a separar ambos casos sin ayuda, porque solo puede asignar UN
+# coeficiente a la columna. Por eso peer se divide en dos series de contexto
+# (activo/standby) ANTES de calcular z-score/CV/p95/tendencia, en vez de
+# tratarse como una métrica más en estas listas genéricas.
+
 # Métricas de latencia con features de tendencia/velocidad/aceleración
 LATENCY_METRICS = [
     ('peer', 'peer_latency_ms'),
@@ -104,8 +125,7 @@ ZSCORE_METRICS = [
     ('loss2', 'dns2_loss_pct'),
 ]
 
-# Métricas con CV (σ_ratio) y desviación de p95 — las tres de latencia,
-# que son las que en la práctica dispararon nuestros failovers reales
+# Métricas con CV (σ_ratio) y desviación de p95 — de latencia
 CV_P95_METRICS = [
     ('peer', 'peer_latency_ms'),
     ('dns1', 'dns1_latency_ms'),
@@ -136,6 +156,13 @@ class TimescaleDBClient:
             return None
         except Exception as e:
             logging.error(f"⚠️ Error leyendo last_timestamp: {e}")
+            # Mismo riesgo que en link_health_feature_engine.py: sin rollback,
+            # un error acá deja la conexión en transacción abortada y tumba
+            # también la siguiente consulta (aunque sea sobre otra tabla sana).
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return None
 
     def insert_ml_features(self, row: pd.Series) -> bool:
@@ -309,7 +336,7 @@ class FeatureEngineV2:
 
             # Derivada del Z (Etapa 2): aceleración de la degradación —
             # sube más rápido en degradación progresiva que en fluctuación normal
-            if name in ('peer', 'dns1', 'dns2'):
+            if name in ('dns1', 'dns2'):
                 df[f'z_deriv_{name}'] = df[f'z_score_{name}'].diff()
 
         return df
@@ -361,6 +388,86 @@ class FeatureEngineV2:
         # así que un salto ciclo-a-ciclo acá es una segunda derivada de la señal)
         df['loss_spike_dns1'] = (df['dns1_loss_pct'].diff().fillna(0) > LOSS_SPIKE_THRESHOLD_PCT)
         df['loss_spike_dns2'] = (df['dns2_loss_pct'].diff().fillna(0) > LOSS_SPIKE_THRESHOLD_PCT)
+
+        return df
+
+    # ------------------------------------------------------------------
+    # ✅ v2.3 — Split activo/standby de TODAS las features de peer
+    # ------------------------------------------------------------------
+    def calculate_peer_context_split_features(self, df):
+        """
+        El motor mide SIEMPRE el peer de PROVIDER1 (ver bgp_failover_engine_new.py
+        v2.6) — 'peer_latency_ms' significa cosas distintas según el proveedor
+        activo: cuando provider=PROVIDER1, es la salud del enlace EN USO;
+        cuando provider=PROVIDER2, es la salud del CANDIDATO DE RETORNO. Un
+        modelo lineal no puede aprender esta distinción con una sola columna
+        ambigua (solo puede asignarle un coeficiente global). Este método
+        separa 'peer' en dos series de contexto — activo/standby — y calcula
+        TODAS las features derivadas (raw + z-score + CV + p95_dev + z_deriv +
+        tendencia/velocidad/aceleración) sobre cada serie por separado.
+
+        ⚠️ Importante: el rolling NO es posicional sobre el DataFrame completo
+        (eso mezclaría de nuevo ambos contextos, con gaps donde no aplica).
+        Es un rolling sobre la SUBSECUENCIA filtrada por contexto — "las
+        últimas N veces que estuvimos en PROVIDER1", no "las últimas N filas
+        del DataFrame". Por eso no se puede reutilizar el loop genérico de
+        calculate_zscore_features/calculate_cv_p95_features/calculate_trend_
+        features (esos SÍ son rolling posicional, correcto para dns1/dns2/
+        jitter/loss porque esas series no tienen esta ambigüedad de contexto).
+
+        ⏸️ PAUSADA — no se llama desde process_and_store() (ver conversación:
+        agregaba columnas que no existen en el schema real, rompía el INSERT).
+        'peer' volvió a las listas genéricas (ZSCORE_METRICS/CV_P95_METRICS/
+        LATENCY_METRICS) — las versiones "ambiguas" (z_score_peer, cv_peer,
+        p95_dev_peer, z_deriv_peer, latency_trend_*_peer, latency_velocity_peer,
+        latency_acceleration_peer) SÍ se calculan de nuevo, tal como antes de
+        introducir este método. Si en el futuro se retoma el split activo/
+        standby, hay que: (1) migrar el schema con las columnas nuevas, (2)
+        sacar 'peer' de las listas genéricas de nuevo, (3) volver a llamar a
+        este método desde process_and_store().
+        """
+        if df.empty:
+            return df
+        logging.info("🔧 Calculando split activo/standby de features de peer...")
+        df = df.sort_values('time').copy()
+
+        is_active = df['provider'] == 'PROVIDER1'   # peer = enlace EN USO
+        is_standby = df['provider'] == 'PROVIDER2'  # peer = candidato de retorno
+
+        # --- Raw: máscara simple, sin rolling ---
+        df['peer_latency_active'] = df['peer_latency_ms'].where(is_active)
+        df['peer_latency_standby'] = df['peer_latency_ms'].where(is_standby)
+        df['peer_jitter_active'] = df['peer_jitter_ms'].where(is_active)
+        df['peer_jitter_standby'] = df['peer_jitter_ms'].where(is_standby)
+        df['peer_loss_active'] = df['peer_loss_pct'].where(is_active)
+        df['peer_loss_standby'] = df['peer_loss_pct'].where(is_standby)
+
+        # --- Derivadas: rolling SOLO sobre la subsecuencia de ese contexto ---
+        for suffix, mask in (('active', is_active), ('standby', is_standby)):
+            sub = df.loc[mask, 'peer_latency_ms']  # ya viene ordenada por time
+
+            roll_mean = sub.rolling(window=TREND_WINDOW_LONG, min_periods=3).mean()
+            roll_std = sub.rolling(window=TREND_WINDOW_LONG, min_periods=3).std(ddof=0)
+            roll_p95 = sub.rolling(window=TREND_WINDOW_LONG, min_periods=3).quantile(0.95)
+
+            z = (sub - roll_mean) / roll_std.replace(0, np.nan)
+            cv = (roll_std / roll_mean.replace(0, np.nan)) * 100
+            p95_dev = (sub - roll_p95) / roll_p95.replace(0, np.nan)
+            z_deriv = z.diff()
+
+            trend_5min = sub.rolling(window=TREND_WINDOW_SHORT, min_periods=1).mean().diff()
+            trend_15min = sub.rolling(window=TREND_WINDOW_LONG, min_periods=1).mean().diff()
+            velocity = sub.diff()
+            acceleration = sub.diff().diff()
+
+            df[f'z_score_peer_{suffix}'] = z.reindex(df.index)
+            df[f'cv_peer_{suffix}'] = cv.reindex(df.index)
+            df[f'p95_dev_peer_{suffix}'] = p95_dev.reindex(df.index)
+            df[f'z_deriv_peer_{suffix}'] = z_deriv.reindex(df.index)
+            df[f'latency_trend_5min_peer_{suffix}'] = trend_5min.reindex(df.index)
+            df[f'latency_trend_15min_peer_{suffix}'] = trend_15min.reindex(df.index)
+            df[f'latency_velocity_peer_{suffix}'] = velocity.reindex(df.index)
+            df[f'latency_acceleration_peer_{suffix}'] = acceleration.reindex(df.index)
 
         return df
 
@@ -476,6 +583,14 @@ class FeatureEngineV2:
         df = self.calculate_zscore_features(df)
         df = self.calculate_cv_p95_features(df)
         df = self.calculate_trend_features(df)
+        # ⏸️ calculate_peer_context_split_features() PAUSADA — ver conversación:
+        # el usuario decidió no aplicar la migración del split activo/standby
+        # de 'peer' en la base real (mismo criterio ya revertido en
+        # xgboost_optimizer.py/train_from_ml_features.py). Si se llamara acá,
+        # agregaría columnas (peer_latency_active, etc.) que no existen en el
+        # schema real de ml_features — el INSERT dinámico fallaría con
+        # "column does not exist". Función queda definida por si se retoma
+        # más adelante, pero no se invoca.
         df = self.calculate_contextual_features(df)
         df = self.calculate_provider_change_context(df)
         df = self.calculate_target(df)
