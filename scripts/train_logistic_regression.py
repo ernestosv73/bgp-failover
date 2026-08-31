@@ -40,6 +40,32 @@ def print_comparison_table(current, xgb_weights, lr_weights_failover, lr_weights
     print("     reemplazo definitivo de 0.27/0.50/0.23.")
 
 
+def print_suggested_weights(lr_weights_failover, lr_weights_retorno):
+    """
+    Pesos candidatos sugeridos = promedio de las 2 estimaciones de Logistic
+    Regression (failover, retorno) — NO se promedia con XGBoost, porque su
+    Gain es un ranking de importancia, no una magnitud lineal comparable en
+    el mismo sentido que un coeficiente (ver conversación). XGBoost se usa
+    como confirmación de DIRECCIÓN, no como tercer término del promedio.
+    """
+    suggested = {
+        k: (lr_weights_failover[k] + lr_weights_retorno[k]) / 2
+        for k in ('peer', 'dns', 'jitter')
+    }
+
+    print("\n" + "=" * 80)
+    print("🎯 PESOS CANDIDATOS SUGERIDOS (promedio LR failover/retorno)")
+    print("=" * 80)
+    print(f"   peer   = {suggested['peer']:.4f}  (actual: 0.27)")
+    print(f"   dns    = {suggested['dns']:.4f}  (actual: 0.50)")
+    print(f"   jitter = {suggested['jitter']:.4f}  (actual: 0.23)")
+    print("\n   ⚠️ Promedio SOLO entre las 2 estimaciones de LR (coeficientes")
+    print("      lineales, comparables entre sí). XGBoost (Gain, un ranking,")
+    print("      no una magnitud lineal) se usa como confirmación de DIRECCIÓN")
+    print("      —no entra en este promedio— ver tabla comparativa de arriba.")
+    return suggested
+
+
 def main():
     import argparse
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -82,6 +108,12 @@ def main():
     print_comparison_table(
         current={'peer': 0.27, 'dns': 0.50, 'jitter': 0.23},
         xgb_weights=xgb_result['candidate_weights'],
+        lr_weights_failover=lr_failover['candidate_weights'],
+        lr_weights_retorno=lr_retorno['candidate_weights'],
+    )
+
+    # ── Pesos candidatos sugeridos (promedio LR) ────────────────────────
+    print_suggested_weights(
         lr_weights_failover=lr_failover['candidate_weights'],
         lr_weights_retorno=lr_retorno['candidate_weights'],
     )
