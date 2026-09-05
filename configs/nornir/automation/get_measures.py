@@ -148,7 +148,7 @@ if __name__ == "__main__":
     print("="*70)
     
     # ID de medición pública (ping a 8.8.8.8). 
-    measurement_id = 207775622  
+    measurement_id = 208230991  
     
     if measurement_id:
         # Descargar resultados (últimos 30 días)
