@@ -2,12 +2,13 @@
 """
 Script para extraer historial continuo de UNA SOLA SONDA desde RIPE Atlas.
 Agrega los 3 paquetes por ciclo calculando avg/stddev.
+Incluye resolución de ASN y country_code desde metadata de la sonda.
 """
 import pandas as pd
 import numpy as np
 import argparse
 from datetime import datetime, timedelta, timezone
-from ripe.atlas.cousteau import AtlasResultsRequest
+from ripe.atlas.cousteau import AtlasResultsRequest, Probe
 import sys
 
 
@@ -71,13 +72,46 @@ Ejemplos de uso:
 
 
 # ==========================================
+# OBTENER METADATA DE LA SONDA
+# ==========================================
+def get_probe_metadata(probe_id):
+    """
+    Obtiene metadata de una sonda (ASN, country_code) usando la API de RIPE Atlas.
+    """
+    print(f"\n Obteniendo metadata de Probe ID {probe_id}...")
+    
+    try:
+        probe = Probe(id=probe_id)
+        metadata = {
+            'asn_v4': probe.asn_v4 if hasattr(probe, 'asn_v4') else 'Unknown',
+            'asn_v6': probe.asn_v6 if hasattr(probe, 'asn_v6') else 'Unknown',
+            'country_code': probe.country_code if hasattr(probe, 'country_code') else 'Unknown',
+            'is_anchor': probe.is_anchor if hasattr(probe, 'is_anchor') else False,
+            'address_v4': probe.address_v4 if hasattr(probe, 'address_v4') else None,
+        }
+        
+        print(f"   ✅ ASN: {metadata['asn_v4']}, Country: {metadata['country_code']}")
+        return metadata
+        
+    except Exception as e:
+        print(f"   ⚠️ Error obteniendo metadata: {e}")
+        return {
+            'asn_v4': 'Unknown',
+            'asn_v6': 'Unknown',
+            'country_code': 'Unknown',
+            'is_anchor': False,
+            'address_v4': None,
+        }
+
+
+# ==========================================
 # DESCARGAR HISTORIAL
 # ==========================================
 def descargar_historial_sonda(msm_id, probe_id, dias_atras):
     """
     Usa AtlasResultsRequest para descargar datos históricos de UNA sola sonda.
     """
-    print(f"\n📥 Solicitando historial de {dias_atras} días para Probe ID {probe_id}...")
+    print(f"\n Solicitando historial de {dias_atras} días para Probe ID {probe_id}...")
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=dias_atras)
@@ -105,7 +139,7 @@ def descargar_historial_sonda(msm_id, probe_id, dias_atras):
 # ==========================================
 # PROCESAR Y AGREGAR POR CICLO
 # ==========================================
-def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
+def procesar_y_agregar_por_ciclo(results, probe_id, msm_id, probe_metadata):
     """
     Procesa los resultados y agrega los 3 paquetes por ciclo.
     Retorna un DataFrame con una fila por ciclo (no por paquete).
@@ -118,7 +152,6 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
     for res in results:
         try:
             timestamp = datetime.fromtimestamp(res.get('timestamp'), tz=timezone.utc)
-            asn = res.get('asn', 'Unknown')
             
             if target_addr is None:
                 target_addr = res.get('dst_addr')
@@ -138,7 +171,8 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
                     'timestamp': timestamp,
                     'cycle_number': None,  # Se asignará después
                     'probe_id': probe_id,
-                    'asn': asn,
+                    'asn': probe_metadata['asn_v4'],
+                    'country_code': probe_metadata['country_code'],
                     'target': target_addr,
                     'rtt_avg_ms': avg_rtt,
                     'rtt_std_ms': std_rtt,
@@ -164,7 +198,7 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
     df['cycle_number'] = range(1, len(df) + 1)
     
     # Reordenar columnas
-    df = df[['cycle_number', 'probe_id', 'target', 'asn', 
+    df = df[['cycle_number', 'probe_id', 'asn', 'country_code', 'target',
              'rtt_avg_ms', 'rtt_std_ms', 'rtt_min_ms', 'rtt_max_ms', 'packets_count']]
     
     print(f"   ✅ {len(df)} ciclos procesados")
@@ -175,7 +209,7 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
 # ==========================================
 # VALIDAR Y GUARDAR
 # ==========================================
-def validar_y_guardar(df, target_addr, probe_id, msm_id, max_rtt, output_file):
+def validar_y_guardar(df, target_addr, probe_id, msm_id, probe_metadata, max_rtt, output_file):
     """
     Filtra outliers, calcula métricas de serie temporal y guarda en CSV.
     """
@@ -194,8 +228,9 @@ def validar_y_guardar(df, target_addr, probe_id, msm_id, max_rtt, output_file):
     # VALIDACIÓN DE SERIE TEMPORAL
     # ==========================================
     print("\n🔬 Validando propiedades de Serie Temporal (Ground Truth):")
-    print(f"   Target: {target_addr} | Probe: {probe_id} | MSM: {msm_id}")
-    print(f"   ASN: {df_filtered['asn'].iloc[0] if len(df_filtered) > 0 else 'Unknown'}")
+    print(f"   Target: {target_addr}")
+    print(f"   Probe: {probe_id} ({probe_metadata['country_code']}, ASN {probe_metadata['asn_v4']})")
+    print(f"   MSM: {msm_id}")
     print(f"   Muestras totales (ciclos): {len(df_filtered):,}")
     
     if len(df_filtered) > 0:
@@ -246,7 +281,7 @@ def main():
     print("="*70)
     print("EXTRACCIÓN DE HISTORIAL CONTINUO DE UNA SOLA SONDA (RIPE Atlas)")
     print("="*70)
-    print(f"\n⚙️  Configuración:")
+    print(f"\n️  Configuración:")
     print(f"   Measurement ID: {args.measurement_id}")
     print(f"   Probe ID: {args.probe_id}")
     print(f"   Días hacia atrás: {args.days}")
@@ -254,30 +289,35 @@ def main():
     if args.output:
         print(f"   Archivo de salida: {args.output}")
     
-    # Paso 1: Descargar historial
+    # Paso 1: Obtener metadata de la sonda
+    probe_metadata = get_probe_metadata(args.probe_id)
+    
+    # Paso 2: Descargar historial
     resultados = descargar_historial_sonda(args.measurement_id, args.probe_id, args.days)
     
     if not resultados:
-        print("\n No se pudieron descargar los resultados.")
+        print("\n❌ No se pudieron descargar los resultados.")
         sys.exit(1)
     
-    # Paso 2: Procesar y agregar por ciclo
+    # Paso 3: Procesar y agregar por ciclo
     df, target_addr = procesar_y_agregar_por_ciclo(
         resultados, 
         args.probe_id, 
-        args.measurement_id
+        args.measurement_id,
+        probe_metadata
     )
     
     if df is None:
         print("\n❌ Error al procesar los datos.")
         sys.exit(1)
     
-    # Paso 3: Validar y guardar
+    # Paso 4: Validar y guardar
     df_final = validar_y_guardar(
         df, 
         target_addr, 
         args.probe_id, 
         args.measurement_id,
+        probe_metadata,
         args.max_rtt,
         args.output
     )
