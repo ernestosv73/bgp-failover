@@ -2,6 +2,7 @@
 """
 Script para extraer historial continuo de UNA SOLA SONDA desde RIPE Atlas.
 Agrega los 3 paquetes por ciclo calculando avg/stddev.
+Calcula 3 tipos de jitter: intra-ciclo, inter-ciclo y RFC 3550.
 Incluye resolución de ASN y country_code desde metadata de la sonda.
 """
 import pandas as pd
@@ -78,7 +79,7 @@ def get_probe_metadata(probe_id):
     """
     Obtiene metadata de una sonda (ASN, country_code) usando la API de RIPE Atlas.
     """
-    print(f"\n Obteniendo metadata de Probe ID {probe_id}...")
+    print(f"\n🔍 Obteniendo metadata de Probe ID {probe_id}...")
     
     try:
         probe = Probe(id=probe_id)
@@ -111,7 +112,7 @@ def descargar_historial_sonda(msm_id, probe_id, dias_atras):
     """
     Usa AtlasResultsRequest para descargar datos históricos de UNA sola sonda.
     """
-    print(f"\n Solicitando historial de {dias_atras} días para Probe ID {probe_id}...")
+    print(f"\n📥 Solicitando historial de {dias_atras} días para Probe ID {probe_id}...")
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=dias_atras)
@@ -137,17 +138,20 @@ def descargar_historial_sonda(msm_id, probe_id, dias_atras):
 
 
 # ==========================================
-# PROCESAR Y AGREGAR POR CICLO
+# PROCESAR, AGREGAR POR CICLO Y CALCULAR JITTERS
 # ==========================================
-def procesar_y_agregar_por_ciclo(results, probe_id, msm_id, probe_metadata):
+def procesar_y_calcular_jitters(results, probe_id, msm_id, probe_metadata):
     """
-    Procesa los resultados y agrega los 3 paquetes por ciclo.
-    Retorna un DataFrame con una fila por ciclo (no por paquete).
+    Procesa los resultados, agrega los 3 paquetes por ciclo y calcula:
+    1. Jitter Intra-Ciclo (std dev de los paquetes del mismo ciclo)
+    2. Jitter Inter-Ciclo (variación entre promedios de ciclos consecutivos)
+    3. Jitter RFC 3550 (IPDV - Inter-Packet Delay Variation)
     """
-    print("\n🔍 Procesando resultados y agregando por ciclo...")
+    print("\n🔍 Procesando resultados, agregando por ciclo y calculando jitters...")
     
     all_data = []
     target_addr = None
+    prev_rtt_avg = None  # Para calcular jitter inter-ciclo
     
     for res in results:
         try:
@@ -156,16 +160,25 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id, probe_metadata):
             if target_addr is None:
                 target_addr = res.get('dst_addr')
             
-            # Extraer los 3 RTT del ciclo
+            # Extraer los RTTs del ciclo
             rtts = []
             for packet in res.get('result', []):
                 if 'rtt' in packet and packet['rtt'] is not None:
                     rtts.append(float(packet['rtt']))
             
             if len(rtts) >= 1:
-                # Calcular avg y stddev de los paquetes del ciclo
+                # Métricas básicas del ciclo
                 avg_rtt = np.mean(rtts)
                 std_rtt = np.std(rtts) if len(rtts) > 1 else 0.0
+                
+                # 1. Jitter Intra-Ciclo (std dev de los paquetes del ciclo)
+                jitter_intra = std_rtt
+                
+                # 2. Jitter Inter-Ciclo (variación entre ciclos consecutivos)
+                jitter_inter = abs(avg_rtt - prev_rtt_avg) if prev_rtt_avg is not None else 0.0
+                
+                # Actualizar para el próximo ciclo
+                prev_rtt_avg = avg_rtt
                 
                 all_data.append({
                     'timestamp': timestamp,
@@ -178,7 +191,9 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id, probe_metadata):
                     'rtt_std_ms': std_rtt,
                     'rtt_min_ms': min(rtts),
                     'rtt_max_ms': max(rtts),
-                    'packets_count': len(rtts)
+                    'packets_count': len(rtts),
+                    'jitter_intra_ms': jitter_intra,
+                    'jitter_inter_ms': jitter_inter,
                 })
         except Exception as e:
             if args.verbose:
@@ -197,11 +212,28 @@ def procesar_y_agregar_por_ciclo(results, probe_id, msm_id, probe_metadata):
     # Asignar cycle_number secuencial
     df['cycle_number'] = range(1, len(df) + 1)
     
+    # 3. Jitter RFC 3550 (IPDV - variación en el delay entre ciclos consecutivos)
+    # Se calcula sobre toda la serie temporal ordenada
+    df['jitter_rfc3550_ms'] = df['rtt_avg_ms'].diff().abs()
+    
     # Reordenar columnas
     df = df[['cycle_number', 'probe_id', 'asn', 'country_code', 'target',
-             'rtt_avg_ms', 'rtt_std_ms', 'rtt_min_ms', 'rtt_max_ms', 'packets_count']]
+             'rtt_avg_ms', 'rtt_std_ms', 'rtt_min_ms', 'rtt_max_ms', 'packets_count',
+             'jitter_intra_ms', 'jitter_inter_ms', 'jitter_rfc3550_ms']]
     
     print(f"   ✅ {len(df)} ciclos procesados")
+    
+    # Mostrar resumen de jitters
+    print(f"\n📊 Resumen de Jitters:")
+    print(f"   Jitter Intra-Ciclo (std dev intra-ciclo):")
+    print(f"      Mediana: {df['jitter_intra_ms'].median():.3f} ms")
+    print(f"      Percentil 95: {df['jitter_intra_ms'].quantile(0.95):.3f} ms")
+    print(f"   Jitter Inter-Ciclo (variación entre ciclos):")
+    print(f"      Mediana: {df['jitter_inter_ms'].median():.3f} ms")
+    print(f"      Percentil 95: {df['jitter_inter_ms'].quantile(0.95):.3f} ms")
+    print(f"   Jitter RFC 3550 (IPDV):")
+    print(f"      Mediana: {df['jitter_rfc3550_ms'].median():.3f} ms")
+    print(f"      Percentil 95: {df['jitter_rfc3550_ms'].quantile(0.95):.3f} ms")
     
     return df, target_addr
 
@@ -241,11 +273,6 @@ def validar_y_guardar(df, target_addr, probe_id, msm_id, probe_metadata, max_rtt
         print(f"   RTT min: {df_filtered['rtt_min_ms'].min():.2f} ms")
         print(f"   RTT max: {df_filtered['rtt_max_ms'].max():.2f} ms")
         
-        # Calcular Jitter Temporal (variación entre ciclos consecutivos)
-        df_filtered = df_filtered.sort_values(['probe_id', 'timestamp'])
-        df_filtered['jitter_ms'] = df_filtered.groupby('probe_id')['rtt_avg_ms'].diff().abs()
-        print(f"   Mediana Jitter: {df_filtered['jitter_ms'].median():.2f} ms")
-        
         # 1. Autocorrelación (Lag-1)
         if len(df_filtered) > 1:
             autocorr = df_filtered['rtt_avg_ms'].autocorr(lag=1)
@@ -265,6 +292,27 @@ def validar_y_guardar(df, target_addr, probe_id, msm_id, probe_metadata, max_rtt
             print(f"   Variación Diurna: {diurnal_var:.1f}% (Off-peak: {median_offpeak:.1f}ms, Peak: {median_peak:.1f}ms)")
         else:
             print("   Variación Diurna: No calculable (datos insuficientes o todos en mismo período)")
+        
+        # 3. Estadísticas detalladas de Jitters
+        print(f"\n📊 Estadísticas detalladas de Jitters:")
+        
+        # Jitter Intra-Ciclo
+        print(f"   Jitter Intra-Ciclo (std dev intra-ciclo):")
+        print(f"      Mediana: {df_filtered['jitter_intra_ms'].median():.3f} ms")
+        print(f"      Percentil 95: {df_filtered['jitter_intra_ms'].quantile(0.95):.3f} ms")
+        print(f"      Máximo: {df_filtered['jitter_intra_ms'].max():.3f} ms")
+        
+        # Jitter Inter-Ciclo
+        print(f"   Jitter Inter-Ciclo (variación entre ciclos):")
+        print(f"      Mediana: {df_filtered['jitter_inter_ms'].median():.3f} ms")
+        print(f"      Percentil 95: {df_filtered['jitter_inter_ms'].quantile(0.95):.3f} ms")
+        print(f"      Máximo: {df_filtered['jitter_inter_ms'].max():.3f} ms")
+        
+        # Jitter RFC 3550
+        print(f"   Jitter RFC 3550 (IPDV):")
+        print(f"      Mediana: {df_filtered['jitter_rfc3550_ms'].median():.3f} ms")
+        print(f"      Percentil 95: {df_filtered['jitter_rfc3550_ms'].quantile(0.95):.3f} ms")
+        print(f"      Máximo: {df_filtered['jitter_rfc3550_ms'].max():.3f} ms")
     else:
         print("   ⚠️  No hay datos suficientes para calcular estadísticas")
     
@@ -296,11 +344,11 @@ def main():
     resultados = descargar_historial_sonda(args.measurement_id, args.probe_id, args.days)
     
     if not resultados:
-        print("\n❌ No se pudieron descargar los resultados.")
+        print("\n No se pudieron descargar los resultados.")
         sys.exit(1)
     
-    # Paso 3: Procesar y agregar por ciclo
-    df, target_addr = procesar_y_agregar_por_ciclo(
+    # Paso 3: Procesar, agregar por ciclo y calcular jitters
+    df, target_addr = procesar_y_calcular_jitters(
         resultados, 
         args.probe_id, 
         args.measurement_id,
