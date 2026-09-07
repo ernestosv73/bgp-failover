@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Script para identificar la sonda más activa desde un CSV previo,
-y luego descargar su historial continuo de 30 días usando la API de RIPE Atlas.
+Script para extraer historial continuo de UNA SOLA SONDA desde RIPE Atlas.
+Agrega los 3 paquetes por ciclo calculando avg/stddev.
 """
-
 import pandas as pd
 import numpy as np
 import argparse
 from datetime import datetime, timedelta, timezone
 from ripe.atlas.cousteau import AtlasResultsRequest
 import sys
+
 
 # ==========================================
 # PARSING DE ARGUMENTOS
@@ -20,17 +20,10 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  %(prog)s --csv-file ripe_atlas_ping_208230991.csv --measurement-id 208230991
-  %(prog)s --csv-file ripe_atlas_ping_208230991.csv --measurement-id 208230991 --days 30
-  %(prog)s --csv-file ripe_atlas_ping_208230991.csv --measurement-id 208230991 --days 14 --output my_data.csv
+  %(prog)s --measurement-id 26304408 --probe-id 54061
+  %(prog)s --measurement-id 26304408 --probe-id 54061 --days 30
+  %(prog)s --measurement-id 26304408 --probe-id 54061 --days 90 --output my_data.csv
         """
-    )
-    
-    parser.add_argument(
-        "--csv-file",
-        type=str,
-        required=True,
-        help="Archivo CSV previo generado por extract_ripe_metrics.py"
     )
     
     parser.add_argument(
@@ -38,6 +31,13 @@ Ejemplos de uso:
         type=int,
         required=True,
         help="ID de la medición de RIPE Atlas (msm_id)"
+    )
+    
+    parser.add_argument(
+        "--probe-id", "-p",
+        type=int,
+        required=True,
+        help="ID de la sonda específica a consultar (probe_id)"
     )
     
     parser.add_argument(
@@ -69,44 +69,6 @@ Ejemplos de uso:
     
     return parser.parse_args()
 
-# ==========================================
-# ENCONTRAR MEJOR SONDA
-# ==========================================
-def encontrar_mejor_sonda(archivo_csv):
-    """
-    Analiza el CSV previo para encontrar la sonda con más mediciones.
-    """
-    print(f"🔍 Analizando {archivo_csv} para encontrar la sonda más activa...")
-    try:
-        df = pd.read_csv(archivo_csv)
-        
-        if 'probe_id' not in df.columns:
-            print("❌ El archivo CSV no contiene la columna 'probe_id'")
-            print(f"   Columnas disponibles: {', '.join(df.columns)}")
-            sys.exit(1)
-        
-        # Contar frecuencias de cada probe_id
-        probe_counts = df['probe_id'].value_counts()
-        
-        if probe_counts.empty:
-            print("❌ No se encontraron probe_ids en el CSV.")
-            sys.exit(1)
-            
-        mejor_probe = probe_counts.idxmax()
-        cantidad = probe_counts.max()
-        
-        print(f"✅ Sonda identificada: Probe ID {mejor_probe}")
-        print(f"   Total de mediciones de esta sonda en el CSV: {cantidad:,}")
-        
-        return int(mejor_probe)
-        
-    except FileNotFoundError:
-        print(f"❌ No se encontró el archivo {archivo_csv}.")
-        print("   Ejecuta primero el script de extracción multi-sonda para generar este CSV.")
-        sys.exit(1)
-    except Exception as e:
-        print(f" Error al procesar el CSV: {e}")
-        sys.exit(1)
 
 # ==========================================
 # DESCARGAR HISTORIAL
@@ -135,53 +97,97 @@ def descargar_historial_sonda(msm_id, probe_id, dias_atras):
     if not is_success:
         print(f"❌ Error en la solicitud: {results}")
         return None
-        
-    print(f"   ✅ {len(results)} paquetes de medición descargados del servidor.")
+    
+    print(f"   ✅ {len(results)} mediciones descargadas del servidor.")
     return results
 
+
 # ==========================================
-# PROCESAR Y VALIDAR
+# PROCESAR Y AGREGAR POR CICLO
 # ==========================================
-def procesar_y_validar(results, probe_id, msm_id, max_rtt, output_file):
+def procesar_y_agregar_por_ciclo(results, probe_id, msm_id):
     """
-    Parsea los resultados, calcula métricas de serie temporal y guarda en CSV.
+    Procesa los resultados y agrega los 3 paquetes por ciclo.
+    Retorna un DataFrame con una fila por ciclo (no por paquete).
     """
-    print("\n⚙️  Procesando y validando continuidad temporal...")
+    print("\n🔍 Procesando resultados y agregando por ciclo...")
     
-    parsed_data = []
+    all_data = []
     target_addr = None
     
     for res in results:
-        timestamp = res.get('timestamp')
-        if target_addr is None:
-            target_addr = res.get('dst_addr')
+        try:
+            timestamp = datetime.fromtimestamp(res.get('timestamp'), tz=timezone.utc)
+            asn = res.get('asn', 'Unknown')
             
-        for packet in res.get('result', []):
-            if 'rtt' in packet and packet['rtt'] is not None:
-                parsed_data.append({
-                    'timestamp': datetime.fromtimestamp(timestamp, tz=timezone.utc),
-                    'rtt_ms': float(packet['rtt']),
-                    'probe_id': probe_id,
-                    'asn': res.get('asn', 'Unknown')
-                })
+            if target_addr is None:
+                target_addr = res.get('dst_addr')
+            
+            # Extraer los 3 RTT del ciclo
+            rtts = []
+            for packet in res.get('result', []):
+                if 'rtt' in packet and packet['rtt'] is not None:
+                    rtts.append(float(packet['rtt']))
+            
+            if len(rtts) >= 1:
+                # Calcular avg y stddev de los paquetes del ciclo
+                avg_rtt = np.mean(rtts)
+                std_rtt = np.std(rtts) if len(rtts) > 1 else 0.0
                 
-    if not parsed_data:
-        print("❌ No se extrajeron datos de RTT válidos.")
-        return None
-        
-    df = pd.DataFrame(parsed_data)
+                all_data.append({
+                    'timestamp': timestamp,
+                    'cycle_number': None,  # Se asignará después
+                    'probe_id': probe_id,
+                    'asn': asn,
+                    'target': target_addr,
+                    'rtt_avg_ms': avg_rtt,
+                    'rtt_std_ms': std_rtt,
+                    'rtt_min_ms': min(rtts),
+                    'rtt_max_ms': max(rtts),
+                    'packets_count': len(rtts)
+                })
+        except Exception as e:
+            if args.verbose:
+                print(f"   ⚠️ Error procesando resultado: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No se extrajeron datos válidos")
+        return None, None
+    
+    # Crear DataFrame
+    df = pd.DataFrame(all_data)
     df.set_index('timestamp', inplace=True)
     df.sort_index(inplace=True)
     
+    # Asignar cycle_number secuencial
+    df['cycle_number'] = range(1, len(df) + 1)
+    
+    # Reordenar columnas
+    df = df[['cycle_number', 'probe_id', 'target', 'asn', 
+             'rtt_avg_ms', 'rtt_std_ms', 'rtt_min_ms', 'rtt_max_ms', 'packets_count']]
+    
+    print(f"   ✅ {len(df)} ciclos procesados")
+    
+    return df, target_addr
+
+
+# ==========================================
+# VALIDAR Y GUARDAR
+# ==========================================
+def validar_y_guardar(df, target_addr, probe_id, msm_id, max_rtt, output_file):
+    """
+    Filtra outliers, calcula métricas de serie temporal y guarda en CSV.
+    """
+    print("\n⚙️  Validando y calculando métricas de serie temporal...")
+    
     # Filtrar outliers
-    df = df[df['rtt_ms'] < max_rtt].copy()
+    df_filtered = df[df['rtt_avg_ms'] < max_rtt].copy()
     
-    # Calcular Jitter Temporal
-    df = df.sort_values(['probe_id', 'timestamp'])
-    df['jitter_ms'] = df.groupby('probe_id')['rtt_ms'].diff().abs()
+    if output_file is None:
+        output_file = f"historial_continuo_probe_{probe_id}.csv"
     
-    # Guardar en archivo
-    df.to_csv(output_file, index=True)
+    df_filtered.to_csv(output_file, index=True)
     print(f"💾 Datos guardados en: {output_file}")
     
     # ==========================================
@@ -189,28 +195,35 @@ def procesar_y_validar(results, probe_id, msm_id, max_rtt, output_file):
     # ==========================================
     print("\n🔬 Validando propiedades de Serie Temporal (Ground Truth):")
     print(f"   Target: {target_addr} | Probe: {probe_id} | MSM: {msm_id}")
-    print(f"   ASN: {df['asn'].iloc[0] if len(df) > 0 else 'Unknown'}")
-    print(f"   Muestras totales: {len(df):,}")
+    print(f"   ASN: {df_filtered['asn'].iloc[0] if len(df_filtered) > 0 else 'Unknown'}")
+    print(f"   Muestras totales (ciclos): {len(df_filtered):,}")
     
-    if len(df) > 0:
-        print(f"   Período: {df.index[0].strftime('%Y-%m-%d %H:%M')} → {df.index[-1].strftime('%Y-%m-%d %H:%M')}")
-        print(f"   Mediana RTT: {df['rtt_ms'].median():.2f} ms")
-        print(f"   Percentil 95 RTT: {df['rtt_ms'].quantile(0.95):.2f} ms")
-        print(f"   Mediana Jitter: {df['jitter_ms'].median():.2f} ms")
+    if len(df_filtered) > 0:
+        print(f"   Período: {df_filtered.index[0].strftime('%Y-%m-%d %H:%M')} → {df_filtered.index[-1].strftime('%Y-%m-%d %H:%M')}")
+        print(f"   Mediana RTT (avg): {df_filtered['rtt_avg_ms'].median():.2f} ms")
+        print(f"   Percentil 95 RTT (avg): {df_filtered['rtt_avg_ms'].quantile(0.95):.2f} ms")
+        print(f"   Mediana RTT std: {df_filtered['rtt_std_ms'].median():.2f} ms")
+        print(f"   RTT min: {df_filtered['rtt_min_ms'].min():.2f} ms")
+        print(f"   RTT max: {df_filtered['rtt_max_ms'].max():.2f} ms")
+        
+        # Calcular Jitter Temporal (variación entre ciclos consecutivos)
+        df_filtered = df_filtered.sort_values(['probe_id', 'timestamp'])
+        df_filtered['jitter_ms'] = df_filtered.groupby('probe_id')['rtt_avg_ms'].diff().abs()
+        print(f"   Mediana Jitter: {df_filtered['jitter_ms'].median():.2f} ms")
         
         # 1. Autocorrelación (Lag-1)
-        if len(df) > 1:
-            autocorr = df['rtt_ms'].autocorr(lag=1)
+        if len(df_filtered) > 1:
+            autocorr = df_filtered['rtt_avg_ms'].autocorr(lag=1)
             print(f"   Autocorrelación (Lag-1): {autocorr:.4f} {'✅ (Buena continuidad)' if autocorr > 0.1 else '⚠️  (Baja continuidad)'}")
         else:
             print("   Autocorrelación: N/A (insuficientes muestras)")
         
         # 2. Variación Diurna
-        df['hour'] = df.index.hour
-        df['is_peak'] = df['hour'].apply(lambda x: 1 if (18 <= x <= 23) or (8 <= x <= 10) else 0)
+        df_filtered['hour'] = df_filtered.index.hour
+        df_filtered['is_peak'] = df_filtered['hour'].apply(lambda x: 1 if (18 <= x <= 23) or (8 <= x <= 10) else 0)
         
-        median_offpeak = df[df['is_peak'] == 0]['rtt_ms'].median()
-        median_peak = df[df['is_peak'] == 1]['rtt_ms'].median()
+        median_offpeak = df_filtered[df_filtered['is_peak'] == 0]['rtt_avg_ms'].median()
+        median_peak = df_filtered[df_filtered['is_peak'] == 1]['rtt_avg_ms'].median()
         
         if pd.notna(median_offpeak) and median_offpeak > 0 and pd.notna(median_peak):
             diurnal_var = ((median_peak - median_offpeak) / median_offpeak) * 100
@@ -219,56 +232,64 @@ def procesar_y_validar(results, probe_id, msm_id, max_rtt, output_file):
             print("   Variación Diurna: No calculable (datos insuficientes o todos en mismo período)")
     else:
         print("   ⚠️  No hay datos suficientes para calcular estadísticas")
-        
-    return df
+    
+    return df_filtered
+
 
 # ==========================================
 # EJECUCIÓN PRINCIPAL
 # ==========================================
 def main():
+    global args
     args = parse_arguments()
     
     print("="*70)
     print("EXTRACCIÓN DE HISTORIAL CONTINUO DE UNA SOLA SONDA (RIPE Atlas)")
     print("="*70)
     print(f"\n⚙️  Configuración:")
-    print(f"   Archivo CSV: {args.csv_file}")
     print(f"   Measurement ID: {args.measurement_id}")
+    print(f"   Probe ID: {args.probe_id}")
     print(f"   Días hacia atrás: {args.days}")
     print(f"   Filtro max RTT: {args.max_rtt} ms")
     if args.output:
         print(f"   Archivo de salida: {args.output}")
     
-    # Paso 1: Encontrar la mejor sonda
-    mejor_probe = encontrar_mejor_sonda(args.csv_file)
+    # Paso 1: Descargar historial
+    resultados = descargar_historial_sonda(args.measurement_id, args.probe_id, args.days)
     
-    # Paso 2: Descargar su historial
-    resultados = descargar_historial_sonda(args.measurement_id, mejor_probe, args.days)
-    
-    # Paso 3: Procesar, validar y guardar
-    if resultados:
-        # Determinar nombre de archivo de salida
-        output_file = args.output
-        if output_file is None:
-            output_file = f"historial_continuo_probe_{mejor_probe}.csv"
-        
-        df_final = procesar_y_validar(
-            resultados, 
-            mejor_probe, 
-            args.measurement_id,
-            args.max_rtt,
-            output_file
-        )
-        
-        if df_final is not None:
-            print("\n✅ ¡Proceso completado! Ahora tienes un Ground Truth válido para series temporales.")
-            print(f"   Siguiente paso: Usa este CSV para entrenar tu modelo generativo.")
-        else:
-            print("\n❌ Error al procesar los datos.")
-            sys.exit(1)
-    else:
-        print("\n❌ No se pudieron descargar los resultados.")
+    if not resultados:
+        print("\n No se pudieron descargar los resultados.")
         sys.exit(1)
+    
+    # Paso 2: Procesar y agregar por ciclo
+    df, target_addr = procesar_y_agregar_por_ciclo(
+        resultados, 
+        args.probe_id, 
+        args.measurement_id
+    )
+    
+    if df is None:
+        print("\n❌ Error al procesar los datos.")
+        sys.exit(1)
+    
+    # Paso 3: Validar y guardar
+    df_final = validar_y_guardar(
+        df, 
+        target_addr, 
+        args.probe_id, 
+        args.measurement_id,
+        args.max_rtt,
+        args.output
+    )
+    
+    if df_final is not None:
+        print("\n✅ ¡Proceso completado!")
+        print(f"   Ahora tienes un Ground Truth válido para series temporales.")
+        print(f"   Siguiente paso: Usa este CSV para entrenar tu modelo generativo.")
+    else:
+        print("\n❌ Error al validar los datos.")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
