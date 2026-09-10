@@ -8,6 +8,8 @@ pip install pandas
 sleep 1
 pip install pynetbox
 sleep 1
+pip install scipy
+sleep 1
 pip install ripe.atlas.cousteau
 sleep 1
 pip install ripe.atlas.sagan
