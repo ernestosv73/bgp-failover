@@ -4,11 +4,15 @@ Script para extraer historial continuo de UNA SOLA SONDA desde RIPE Atlas.
 Agrega los 3 paquetes por ciclo calculando avg/stddev.
 Calcula 3 tipos de jitter: intra-ciclo, inter-ciclo y RFC 3550.
 Incluye resolución de ASN y country_code desde metadata de la sonda.
+Calcula variación diurna usando la zona horaria local de la sonda.
+Usa autocorrelación de Spearman (robusta a outliers).
 """
 import pandas as pd
 import numpy as np
 import argparse
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from scipy.stats import spearmanr
 from ripe.atlas.cousteau import AtlasResultsRequest, Probe
 import sys
 
@@ -103,6 +107,96 @@ def get_probe_metadata(probe_id):
             'is_anchor': False,
             'address_v4': None,
         }
+
+
+# ==========================================
+# OBTENER ZONA HORARIA DE LA SONDA
+# ==========================================
+def get_probe_timezone(probe_id, country_code):
+    """
+    Obtiene la zona horaria de la sonda basada en su country_code.
+    Retorna un objeto ZoneInfo o UTC por defecto.
+    """
+    # Mapeo de país a zona horaria principal
+    country_to_tz = {
+        'DE': 'Europe/Berlin',
+        'US': 'America/New_York',
+        'BR': 'America/Sao_Paulo',
+        'UY': 'America/Montevideo',
+        'NL': 'Europe/Amsterdam',
+        'FR': 'Europe/Paris',
+        'GB': 'Europe/London',
+        'JP': 'Asia/Tokyo',
+        'AU': 'Australia/Sydney',
+        'ES': 'Europe/Madrid',
+        'IT': 'Europe/Rome',
+        'CA': 'America/Toronto',
+        'MX': 'America/Mexico_City',
+        'AR': 'America/Argentina/Buenos_Aires',
+        'CL': 'America/Santiago',
+        'CO': 'America/Bogota',
+        'PE': 'America/Lima',
+        'RU': 'Europe/Moscow',
+        'CN': 'Asia/Shanghai',
+        'IN': 'Asia/Kolkata',
+        'KR': 'Asia/Seoul',
+        'SG': 'Asia/Singapore',
+        'PL': 'Europe/Warsaw',
+        'SE': 'Europe/Stockholm',
+        'NO': 'Europe/Oslo',
+        'FI': 'Europe/Helsinki',
+        'DK': 'Europe/Copenhagen',
+        'BE': 'Europe/Brussels',
+        'AT': 'Europe/Vienna',
+        'CH': 'Europe/Zurich',
+        'PT': 'Europe/Lisbon',
+        'GR': 'Europe/Athens',
+        'TR': 'Europe/Istanbul',
+        'IL': 'Asia/Jerusalem',
+        'ZA': 'Africa/Johannesburg',
+        'EG': 'Africa/Cairo',
+        'NG': 'Africa/Lagos',
+        'KE': 'Africa/Nairobi',
+        'NZ': 'Pacific/Auckland',
+    }
+    
+    if country_code and country_code in country_to_tz:
+        tz_name = country_to_tz[country_code]
+        print(f"   🌍 Zona horaria detectada para Probe {probe_id} ({country_code}): {tz_name}")
+        return ZoneInfo(tz_name)
+    else:
+        print(f"   ⚠️ Zona horaria no disponible para país '{country_code}', usando UTC")
+        return ZoneInfo('UTC')
+
+
+# ==========================================
+# CALCULAR AUTOCORRELACIÓN DE SPEARMAN
+# ==========================================
+def calcular_autocorrelacion_spearman(series, lag=1):
+    """
+    Calcula la autocorrelación usando el coeficiente de Spearman.
+    Robusta a outliers y no asume distribución normal.
+    
+    Args:
+        series: Serie temporal de pandas
+        lag: Retraso temporal (default: 1)
+    
+    Returns:
+        coeficiente de correlación de Spearman (float)
+    """
+    # Crear serie desplazada
+    series_shifted = series.shift(lag)
+    
+    # Eliminar valores NaN
+    valid_pairs = pd.concat([series, series_shifted], axis=1).dropna()
+    
+    if len(valid_pairs) < 10:  # Mínimo de muestras para cálculo significativo
+        return float('nan')
+    
+    # Calcular correlación de Spearman
+    coeficiente, p_value = spearmanr(valid_pairs.iloc[:, 0], valid_pairs.iloc[:, 1])
+    
+    return coeficiente
 
 
 # ==========================================
@@ -244,6 +338,8 @@ def procesar_y_calcular_jitters(results, probe_id, msm_id, probe_metadata):
 def validar_y_guardar(df, target_addr, probe_id, msm_id, probe_metadata, max_rtt, output_file):
     """
     Filtra outliers, calcula métricas de serie temporal y guarda en CSV.
+    Incluye cálculo de variación diurna usando zona horaria local.
+    Usa autocorrelación de Spearman (robusta a outliers).
     """
     print("\n⚙️  Validando y calculando métricas de serie temporal...")
     
@@ -273,28 +369,60 @@ def validar_y_guardar(df, target_addr, probe_id, msm_id, probe_metadata, max_rtt
         print(f"   RTT min: {df_filtered['rtt_min_ms'].min():.2f} ms")
         print(f"   RTT max: {df_filtered['rtt_max_ms'].max():.2f} ms")
         
-        # 1. Autocorrelación (Lag-1)
-        if len(df_filtered) > 1:
-            autocorr = df_filtered['rtt_avg_ms'].autocorr(lag=1)
-            print(f"   Autocorrelación (Lag-1): {autocorr:.4f} {'✅ (Buena continuidad)' if autocorr > 0.1 else '⚠️  (Baja continuidad)'}")
+        # 1. Autocorrelación de Spearman (Lag-1) - ROBUSTA A OUTLIERS
+        if len(df_filtered) > 10:
+            autocorr_spearman = calcular_autocorrelacion_spearman(df_filtered['rtt_avg_ms'], lag=1)
+            
+            # También calcular Pearson para comparación
+            autocorr_pearson = df_filtered['rtt_avg_ms'].autocorr(lag=1)
+            
+            print(f"\n   📊 Autocorrelación Temporal:")
+            print(f"      Spearman (Lag-1): {autocorr_spearman:.4f} {'✅ (Buena continuidad)' if autocorr_spearman > 0.3 else '⚠️  (Baja continuidad)'}")
+            print(f"      Pearson (Lag-1): {autocorr_pearson:.4f} {'✅' if autocorr_pearson > 0.3 else '⚠️'}")
+            
+            # Explicar la diferencia si es significativa
+            diff = abs(autocorr_spearman - autocorr_pearson)
+            if diff > 0.2:
+                print(f"      ℹ️  Diferencia significativa ({diff:.3f}): Spearman es más confiable por presencia de outliers")
         else:
             print("   Autocorrelación: N/A (insuficientes muestras)")
         
-        # 2. Variación Diurna
-        df_filtered['hour'] = df_filtered.index.hour
-        df_filtered['is_peak'] = df_filtered['hour'].apply(lambda x: 1 if (18 <= x <= 23) or (8 <= x <= 10) else 0)
+        # 2. Variación Diurna (con zona horaria local)
+        probe_tz = get_probe_timezone(probe_id, probe_metadata['country_code'])
+        
+        # Convertir timestamps UTC a hora local
+        df_filtered['local_time'] = df_filtered.index.tz_convert(probe_tz)
+        df_filtered['local_hour'] = df_filtered['local_time'].dt.hour
+        
+        # Definir peak/off-peak en hora LOCAL
+        # Peak: 07:00-09:59 y 19:00-23:59 (hora local)
+        # Off-peak: 00:00-06:59 y 10:00-18:59 (hora local)
+        df_filtered['is_peak'] = df_filtered['local_hour'].apply(
+            lambda x: 1 if (7 <= x <= 9) or (19 <= x <= 23) else 0
+        )
         
         median_offpeak = df_filtered[df_filtered['is_peak'] == 0]['rtt_avg_ms'].median()
         median_peak = df_filtered[df_filtered['is_peak'] == 1]['rtt_avg_ms'].median()
         
+        print(f"\n    Variación Diurna (hora local {probe_tz}):")
+        print(f"      Peak hours (07-10h, 19-24h local): {median_peak:.2f} ms")
+        print(f"      Off-peak hours (00-07h, 10-19h local): {median_offpeak:.2f} ms")
+        
         if pd.notna(median_offpeak) and median_offpeak > 0 and pd.notna(median_peak):
             diurnal_var = ((median_peak - median_offpeak) / median_offpeak) * 100
-            print(f"   Variación Diurna: {diurnal_var:.1f}% (Off-peak: {median_offpeak:.1f}ms, Peak: {median_peak:.1f}ms)")
+            print(f"      Variación Diurna: {diurnal_var:.1f}%")
+            
+            if diurnal_var > 5:
+                print(f"      ✅ Patrón diurno positivo detectado (mayor latencia en horas pico)")
+            elif diurnal_var < -5:
+                print(f"      ️  Patrón diurno negativo (menor latencia en horas pico - posible artefacto)")
+            else:
+                print(f"      ℹ️  Variación diurna mínima (path estable)")
         else:
-            print("   Variación Diurna: No calculable (datos insuficientes o todos en mismo período)")
+            print("      ⚠️  Variación Diurna: No calculable (datos insuficientes)")
         
         # 3. Estadísticas detalladas de Jitters
-        print(f"\n📊 Estadísticas detalladas de Jitters:")
+        print(f"\n Estadísticas detalladas de Jitters:")
         
         # Jitter Intra-Ciclo
         print(f"   Jitter Intra-Ciclo (std dev intra-ciclo):")
@@ -329,7 +457,7 @@ def main():
     print("="*70)
     print("EXTRACCIÓN DE HISTORIAL CONTINUO DE UNA SOLA SONDA (RIPE Atlas)")
     print("="*70)
-    print(f"\n️  Configuración:")
+    print(f"\n⚙️  Configuración:")
     print(f"   Measurement ID: {args.measurement_id}")
     print(f"   Probe ID: {args.probe_id}")
     print(f"   Días hacia atrás: {args.days}")
@@ -344,7 +472,7 @@ def main():
     resultados = descargar_historial_sonda(args.measurement_id, args.probe_id, args.days)
     
     if not resultados:
-        print("\n No se pudieron descargar los resultados.")
+        print("\n❌ No se pudieron descargar los resultados.")
         sys.exit(1)
     
     # Paso 3: Procesar, agregar por ciclo y calcular jitters
