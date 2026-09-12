@@ -14,6 +14,8 @@ pip install ripe.atlas.cousteau
 sleep 1
 pip install ripe.atlas.sagan
 sleep 1
+pip install ripe-atlas-tools
+sleep 1
 pip install nornir-jinja2
 sleep 1
 pip install nornir-netbox
