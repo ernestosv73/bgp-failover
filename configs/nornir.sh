@@ -35,3 +35,5 @@ apt install postgresql-client -y
 sleep 1
 apt install python3-numpy -y
 sleep 1
+pip install ipwhois --break-system-packages
+sleep 1
