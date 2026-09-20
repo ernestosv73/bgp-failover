@@ -142,10 +142,12 @@ def main():
         ts = res.get('timestamp')
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         hops = res.get('result', [])
-        dst_addr = res.get('dst_addr', 'Unknown')  # ✅ FIX #8 -- rastrear el destino real
+        dst_addr = res.get('dst_addr', 'Unknown')
+        dst_responded = res.get('destination_ip_responded', None)  # ✅ FIX #9
 
         cycle_hops = []
         current_len = 0
+        timeout_slots = 0  # ✅ FIX #10 -- saltos con pérdida total (todos los paquetes '*')
 
         for h in hops:
             hop_num = h.get('hop')
@@ -164,6 +166,7 @@ def main():
             first_pkt = next((r for r in hop_res if isinstance(r, dict) and r.get('rtt') is not None), None)
 
             if first_pkt is None:
+                timeout_slots += 1
                 continue
 
             rtt_hop = float(first_pkt['rtt'])
@@ -180,6 +183,8 @@ def main():
                 'hops': cycle_hops,
                 'length': current_len,
                 'dst_addr': dst_addr,
+                'dst_responded': dst_responded,
+                'timeout_slots': timeout_slots,
             })
 
     # ✅ FIX #3 — resolver ASN por IP única (con caché), y adjuntarlo a CADA
@@ -209,6 +214,7 @@ def main():
     prev_hops_by_num = {}   # {hop_num: {'ip', 'rtt', 'asn'}} del ciclo ANTERIOR
     prev_length = None
     prev_dst_addr = None
+    prev_timeout_slots = None
 
     for cycle in cycles_data:
         dt_str = cycle['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
@@ -228,8 +234,31 @@ def main():
             )
 
         # 🟡 Cambio de longitud vs. el ciclo INMEDIATAMENTE anterior
-        if prev_length is not None and cycle['length'] != prev_length:
-            cycle_anomalies.append(f"🟡 Path Length: {cycle['length']} hops (Anterior: {prev_length})")
+        # ✅ FIX #9 (simplificado) — en vez de perseguir causas técnicas
+        # específicas (destino sin responder, MPLS, pérdida intermedia --
+        # cada una explica ALGUNOS casos pero no todos, confirmado con
+        # evidencia real de al menos 3 mecanismos distintos produciendo el
+        # mismo síntoma), se aplica una regla empírica más simple y robusta:
+        # un cambio de longitud SOLO cuenta como cambio de ruta genuino si
+        # viene acompañado de al menos un 🔴 real en el MISMO ciclo. Aislado,
+        # se reclasifica como ⚪ (sospechoso, no cuenta) y queda a criterio
+        # del investigador revisar la URL si quiere confirmar la causa
+        # puntual. Confirmado con 7/7 episodios investigados manualmente.
+        length_changed = prev_length is not None and cycle['length'] != prev_length
+        length_desc = f"🟡 Path Length: {cycle['length']} hops (Anterior: {prev_length})" if length_changed else None
+
+        # 📉 FIX #10 — pérdida intermedia como categoría PROPIA, separada de
+        # 'cambio de ruta'. Confirmado con evidencia real (2026-03-02 20:44):
+        # un aumento de timeouts intermedios puede desplazar el conteo de
+        # saltos SIN que haya degradación de RTT hacia el destino ni cambio
+        # de ruta genuino -- es una señal real de pérdida, pero de una
+        # naturaleza distinta a las otras 3 categorías, y merece su propio
+        # registro en vez de perderse o confundirse con 'Path Length'.
+        if prev_timeout_slots is not None and cycle['timeout_slots'] > prev_timeout_slots:
+            cycle_anomalies.append(
+                f"📉 Pérdida intermedia aumentó: {cycle['timeout_slots']} saltos sin respuesta "
+                f"(Anterior: {prev_timeout_slots}) — sin cambio de ruta ni degradación de RTT al destino"
+            )
 
         for h in cycle['hops']:
             hop_num, rtt, ip, asn = h['hop'], h['rtt'], h['ip'], h['asn']
@@ -286,6 +315,15 @@ def main():
                 'timestamp': dt_str, 'hop': hop_num, 'ip': ip, 'asn': asn, 'rtt_ms': rtt,
             })
 
+        # Decisión final del cambio de longitud, ya con el ciclo completo procesado
+        if length_desc is not None:
+            hay_cambio_real = any(a.startswith('🔴') for a in cycle_anomalies)
+            if hay_cambio_real:
+                cycle_anomalies.insert(0, length_desc)
+            else:
+                cycle_info.insert(0, f"⚪ {length_desc[2:]} — sin cambio de ASN/IP real acompañante, "
+                                      f"probable artefacto de pérdida intermedia, NO cuenta como cambio de ruta")
+
         if cycle_anomalies:
             anomalies_per_cycle.append({
                 'timestamp': dt_str, 'ts_ms': cycle['ts_ms'],
@@ -295,6 +333,7 @@ def main():
         prev_hops_by_num = current_hops_by_num
         prev_length = cycle['length']
         prev_dst_addr = cycle['dst_addr']
+        prev_timeout_slots = cycle['timeout_slots']
 
     # 4. Guardar CSV
     output_file = args.output or f"historial_traceroute_probe_{args.probe_id}.csv"
@@ -311,6 +350,7 @@ def main():
     # ya que un mismo ciclo puede tener varias categorías a la vez, como
     # vimos con el caso Facebook: 🟠+🟡+🔴 juntos en el mismo ciclo)
     conteo = Counter()
+    conteo_info = Counter()
     for item in anomalies_per_cycle:
         for anom in item['anomalies']:
             if anom.startswith('🟣⬛'):
@@ -322,14 +362,22 @@ def main():
             elif anom.startswith('🔴'):
                 conteo['Cambio de IP/ASN en un salto'] += 1
             elif anom.startswith('🟡'):
-                conteo['Cambio de longitud de camino'] += 1
+                conteo['Cambio de longitud (con 🔴 real acompañante)'] += 1
             elif anom.startswith('🟠'):
                 conteo['Cambio de destino (dst_addr)'] += 1
+            elif anom.startswith('⚪'):
+                conteo_info['Longitud sospechosa (sin 🔴 real, no cuenta)'] += 1
+            elif anom.startswith('📉'):
+                conteo['Pérdida intermedia aumentó'] += 1
 
     if conteo:
         print(f"\n📋 Desglose por categoría ({sum(conteo.values())} líneas totales):")
         for categoria, cantidad in conteo.most_common():
-            print(f"   {categoria:35s}: {cantidad}")
+            print(f"   {categoria:45s}: {cantidad}")
+    if conteo_info:
+        print(f"\nℹ️ Informativo, no cuenta como anomalía:")
+        for categoria, cantidad in conteo_info.most_common():
+            print(f"   {categoria:45s}: {cantidad}")
 
     if anomalies_per_cycle:
         print(f"\n🔗 Los {len(anomalies_per_cycle)} ciclos con anomalías (orden cronológico):")
