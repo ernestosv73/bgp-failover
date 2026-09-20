@@ -142,6 +142,7 @@ def main():
         ts = res.get('timestamp')
         dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         hops = res.get('result', [])
+        dst_addr = res.get('dst_addr', 'Unknown')  # ✅ FIX #8 -- rastrear el destino real
 
         cycle_hops = []
         current_len = 0
@@ -177,7 +178,8 @@ def main():
                 'timestamp': dt,
                 'ts_ms': int(ts * 1000),
                 'hops': cycle_hops,
-                'length': current_len
+                'length': current_len,
+                'dst_addr': dst_addr,
             })
 
     # ✅ FIX #3 — resolver ASN por IP única (con caché), y adjuntarlo a CADA
@@ -206,12 +208,24 @@ def main():
     csv_rows = []
     prev_hops_by_num = {}   # {hop_num: {'ip', 'rtt', 'asn'}} del ciclo ANTERIOR
     prev_length = None
+    prev_dst_addr = None
 
     for cycle in cycles_data:
         dt_str = cycle['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-        cycle_anomalies = []   # cuentan para el total (🟣 🟡 🔴 real)
+        cycle_anomalies = []   # cuentan para el total (🟣 🟡 🔴 🟠 real)
         cycle_info = []        # solo informativo, NO cuenta (ℹ️ balanceo interno)
         current_hops_by_num = {h['hop']: h for h in cycle['hops']}
+
+        # 🟠 FIX #8 — cambio de DESTINO (dst_addr), distinto de cambio de ruta
+        # hacia el mismo destino. Confirmado con evidencia real: 'facebook.com'
+        # resolvió a un PoP distinto (Amsterdam->Frankfurt) durante el episodio
+        # del 2026-04-02 -- lo que antes se interpretaba como 'cambio de AS-path'
+        # era, en realidad, redirección DNS/anycast hacia un destino distinto.
+        if prev_dst_addr is not None and cycle['dst_addr'] != prev_dst_addr:
+            cycle_anomalies.append(
+                f"🟠 Destino cambió: {cycle['dst_addr']} (Anterior: {prev_dst_addr}) "
+                f"— probable redirección DNS/anycast, no cambio de ruta hacia el mismo destino"
+            )
 
         # 🟡 Cambio de longitud vs. el ciclo INMEDIATAMENTE anterior
         if prev_length is not None and cycle['length'] != prev_length:
@@ -280,6 +294,7 @@ def main():
 
         prev_hops_by_num = current_hops_by_num
         prev_length = cycle['length']
+        prev_dst_addr = cycle['dst_addr']
 
     # 4. Guardar CSV
     output_file = args.output or f"historial_traceroute_probe_{args.probe_id}.csv"
@@ -291,6 +306,30 @@ def main():
     print(f"   Ciclos totales analizados: {len(cycles_data)}")
     print(f"   Ciclos con anomalías: {len(anomalies_per_cycle)} "
           f"({100*len(anomalies_per_cycle)/max(1, len(cycles_data)):.1f}%)")
+
+    # ✅ Desglose por categoría -- cuenta cada LÍNEA de anomalía (no ciclo,
+    # ya que un mismo ciclo puede tener varias categorías a la vez, como
+    # vimos con el caso Facebook: 🟠+🟡+🔴 juntos en el mismo ciclo)
+    conteo = Counter()
+    for item in anomalies_per_cycle:
+        for anom in item['anomalies']:
+            if anom.startswith('🟣⬛'):
+                conteo['RTT - Dark (>200%)'] += 1
+            elif anom.startswith('🟣🟪'):
+                conteo['RTT - Medium (40-200%)'] += 1
+            elif anom.startswith('🟣'):
+                conteo['RTT - Light (20-40%)'] += 1
+            elif anom.startswith('🔴'):
+                conteo['Cambio de IP/ASN en un salto'] += 1
+            elif anom.startswith('🟡'):
+                conteo['Cambio de longitud de camino'] += 1
+            elif anom.startswith('🟠'):
+                conteo['Cambio de destino (dst_addr)'] += 1
+
+    if conteo:
+        print(f"\n📋 Desglose por categoría ({sum(conteo.values())} líneas totales):")
+        for categoria, cantidad in conteo.most_common():
+            print(f"   {categoria:35s}: {cantidad}")
 
     if anomalies_per_cycle:
         print(f"\n🔗 Los {len(anomalies_per_cycle)} ciclos con anomalías (orden cronológico):")
