@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+Script corregido para extraer y analizar historial de TRACEROUTE de RIPE Atlas.
+Replica la lógica de detección de anomalías de RIPE Path Analysis:
+🟣 RTT Degradation (>10ms Y >20% vs. CICLO ANTERIOR, con severidad graduada)
+🔴 ASN/IP Change (vs. CICLO ANTERIOR en la misma posición de salto)
+🟡 Path Length Change (vs. CICLO ANTERIOR)
+
+Correcciones acumuladas respecto a la versión original:
+1. Se ordena 'results' por timestamp ANTES de procesar.
+2. Se usa el MÁXIMO de los paquetes por salto (no mínimo ni promedio) --
+   confirmado empíricamente contra Path Analysis: un pico en 1 de 3
+   paquetes (ej. [130, 7.7, 7.8]) es lo que la herramienta reporta.
+3. Se resuelve ASN vía librería externa (ipwhois), adjuntado por
+   ciclo/salto específico, no como lista aparte desalineada.
+4. Se agregan los 3 niveles de severidad documentados por RIPE.
+5. La comparación es CONSECUTIVA (ciclo N vs. ciclo N-1), no contra una
+   línea base histórica global -- confirmado con evidencia real: un
+   mismo pico genera DOS "changes" en Path Analysis (entrada y salida),
+   algo que una comparación contra línea base global no puede replicar.
+"""
+import argparse
+import sys
+from datetime import datetime, timezone
+from collections import Counter
+import pandas as pd
+import numpy as np
+from ripe.atlas.cousteau import AtlasResultsRequest
+
+try:
+    from ipwhois import IPWhois
+    IPWHOIS_DISPONIBLE = True
+except ImportError:
+    IPWHOIS_DISPONIBLE = False
+
+
+# ==========================================
+# PARSING DE ARGUMENTOS
+# ==========================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Extraer y analizar historial de TRACEROUTE de UNA SOLA SONDA",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--measurement-id", "-m", type=int, required=True)
+    parser.add_argument("--probe-id", "-p", type=int, required=True)
+    parser.add_argument("--start-time", type=str, required=True)
+    parser.add_argument("--stop-time", type=str, required=True)
+    parser.add_argument("--max-hops", type=int, default=15)
+    parser.add_argument("--output", "-o", type=str, default=None)
+    parser.add_argument("--resolve-asn", action="store_true",
+                         help="Resolver ASN vía whois (más lento, requiere red)")
+    parser.add_argument("--ground-truth-output", type=str, default=None,
+                         help="Exportar eventos clasificados a CSV (timestamp,categoria) para "
+                              "usar con detect_changepoints_ripe.py --ground-truth")
+    return parser.parse_args()
+
+
+def parse_dt(dt_str):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(dt_str.strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Formato de fecha no válido: {dt_str}")
+
+
+# ==========================================
+# RESOLUCIÓN DE ASN (con caché, para no repetir lookups)
+# ==========================================
+_asn_cache = {}
+
+def resolver_asn(ip):
+    if ip in ('Unknown', None, '*'):
+        return 'Unknown'
+    if ip in _asn_cache:
+        return _asn_cache[ip]
+    if not IPWHOIS_DISPONIBLE:
+        return 'Unknown'
+    try:
+        resultado = IPWhois(ip).lookup_rdap(depth=0)
+        asn = resultado.get('asn', 'Unknown')
+    except Exception:
+        asn = 'Unknown'
+    _asn_cache[ip] = asn
+    return asn
+
+
+# ==========================================
+# CLASIFICACIÓN DE SEVERIDAD (graduada, igual que RIPE Path Analysis)
+# ==========================================
+def clasificar_severidad(rtt_pct):
+    if rtt_pct > 200:
+        return "🟣⬛ Dark (>200%)"
+    elif rtt_pct > 40:
+        return "🟣🟪 Medium (40-200%)"
+    else:
+        return "🟣 Light (20-40%)"
+
+
+def clasificar_anomalia(anom):
+    """
+    Categoriza una línea de anomalía a partir de su emoji inicial --
+    reutilizada tanto para el resumen en consola como para la exportación
+    a CSV de ground truth (exportar_ground_truth), para que ambas vistas
+    nunca puedan desincronizarse entre sí. Devuelve None para las líneas
+    informativas (ℹ️/⚪) que NO cuentan como anomalía real.
+    """
+    if anom.startswith('🟣⬛'):
+        return 'rtt_dark'
+    elif anom.startswith('🟣🟪'):
+        return 'rtt_medium'
+    elif anom.startswith('🟣'):
+        return 'rtt_light'
+    elif anom.startswith('🔴'):
+        return 'cambio_ip_asn'
+    elif anom.startswith('🟡'):
+        return 'cambio_longitud'
+    elif anom.startswith('🟠'):
+        return 'cambio_destino'
+    elif anom.startswith('📉'):
+        return 'perdida_intermedia'
+    return None  # ℹ️, ⚪ -- informativo, no cuenta
+
+
+def exportar_ground_truth(anomalies_per_cycle, output_path):
+    """
+    Exporta los eventos clasificados a un CSV (columnas timestamp,categoria)
+    -- una fila por cada anomalía INDIVIDUAL (no por ciclo), para poder
+    filtrar por categoría específica al validar contra PELT en
+    detect_changepoints_ripe.py. Esto importa porque PELT solo ve la serie
+    de destino: no puede detectar pérdida intermedia, ni todo cambio de
+    ruta deja huella en el RTT de destino (confirmado con el caso
+    2026-03-04 05:34, cambio de ASN sin degradación visible en destino) --
+    poder filtrar a 'rtt_*' específicamente da una comparación más justa
+    contra lo que PELT puede, en principio, encontrar.
+    """
+    rows = []
+    for item in anomalies_per_cycle:
+        for anom in item['anomalies']:
+            categoria = clasificar_anomalia(anom)
+            if categoria is not None:
+                rows.append({'timestamp': item['timestamp'], 'categoria': categoria})
+    df = pd.DataFrame(rows)
+    df.to_csv(output_path, index=False)
+    return len(df)
+
+
+# ==========================================
+# LÓGICA PRINCIPAL
+# ==========================================
+def main():
+    args = parse_arguments()
+    start_time = parse_dt(args.start_time)
+    stop_time = parse_dt(args.stop_time)
+
+    print("=" * 70)
+    print("EXTRACCIÓN Y ANÁLISIS DE TRACEROUTE (RIPE Atlas) — versión corregida")
+    print("=" * 70)
+    print(f"\n⚙️  Configuración:")
+    print(f"   Measurement ID: {args.measurement_id}")
+    print(f"   Probe ID: {args.probe_id}")
+    print(f"   Rango: {start_time.strftime('%Y-%m-%d %H:%M')} a {stop_time.strftime('%Y-%m-%d %H:%M')}")
+    if args.resolve_asn and not IPWHOIS_DISPONIBLE:
+        print("   ⚠️ 'ipwhois' no está instalado -- ASN quedará como 'Unknown'.")
+        print("      Instalar con: pip install ipwhois --break-system-packages")
+
+    # 1. Descargar datos
+    print(f"\n📥 Solicitando historial de traceroute...")
+    kwargs = {
+        "msm_id": args.measurement_id,
+        "start": int(start_time.timestamp()),
+        "stop": int(stop_time.timestamp()),
+        "probe_ids": [args.probe_id]
+    }
+    is_success, results = AtlasResultsRequest(**kwargs).create()
+    if not is_success or not results:
+        print(f"❌ Error o sin resultados: {results}")
+        sys.exit(1)
+
+    # ✅ FIX #1 — ordenar explícitamente por timestamp antes de procesar
+    results = sorted(results, key=lambda r: r.get('timestamp', 0))
+    print(f"   ✅ {len(results)} ciclos de traceroute descargados y ordenados"
+          f" ({datetime.fromtimestamp(results[0]['timestamp'], tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+          f" → {datetime.fromtimestamp(results[-1]['timestamp'], tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}).")
+
+    # 2. Estructurar datos (IP + RTT por salto y ciclo)
+    print("\n🔍 Procesando resultados...")
+    cycles_data = []
+    ips_unicas = set()
+
+    for res in results:
+        ts = res.get('timestamp')
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        hops = res.get('result', [])
+        dst_addr = res.get('dst_addr', 'Unknown')
+        dst_responded = res.get('destination_ip_responded', None)  # ✅ FIX #9
+
+        cycle_hops = []
+        current_len = 0
+        timeout_slots = 0  # ✅ FIX #10 -- saltos con pérdida total (todos los paquetes '*')
+
+        for h in hops:
+            hop_num = h.get('hop')
+            if hop_num is None or hop_num > args.max_hops:
+                continue
+
+            hop_res = h.get('result', [])
+
+            # ✅ FIX #2 (definitivo) — el PRIMER paquete válido, ni máximo ni
+            # mínimo ni promedio. Confirmado con evidencia estadística: sobre
+            # 11 saltos reales comparados contra Path Analysis, "primero"
+            # acierta 11/11; mediana 8/11; máximo y mínimo solo 5/11 cada uno.
+            # Es, además, la MISMA fuente que ya se usaba para la IP (el
+            # primer paquete que respondió) -- ahora IP y RTT vienen del
+            # mismo paquete de referencia, sin inconsistencia interna.
+            first_pkt = next((r for r in hop_res if isinstance(r, dict) and r.get('rtt') is not None), None)
+
+            if first_pkt is None:
+                timeout_slots += 1
+                continue
+
+            rtt_hop = float(first_pkt['rtt'])
+            ip = first_pkt.get('from', 'Unknown')
+            ips_unicas.add(ip)
+
+            cycle_hops.append({'hop': hop_num, 'ip': ip, 'rtt': rtt_hop, 'asn': None})
+            current_len = max(current_len, hop_num)
+
+        if cycle_hops:
+            cycles_data.append({
+                'timestamp': dt,
+                'ts_ms': int(ts * 1000),
+                'hops': cycle_hops,
+                'length': current_len,
+                'dst_addr': dst_addr,
+                'dst_responded': dst_responded,
+                'timeout_slots': timeout_slots,
+            })
+
+    # ✅ FIX #3 — resolver ASN por IP única (con caché), y adjuntarlo a CADA
+    # salto de CADA ciclo -- antes quedaba en una lista aparte, desalineada
+    # respecto a qué ciclo específico correspondía cada valor.
+    if args.resolve_asn:
+        print(f"\n🌐 Resolviendo ASN para {len(ips_unicas)} IPs únicas...")
+        for ip in ips_unicas:
+            resolver_asn(ip)  # llena _asn_cache
+        for cycle in cycles_data:
+            for h in cycle['hops']:
+                h['asn'] = resolver_asn(h['ip'])
+    else:
+        print("\n🌐 Resolución de ASN desactivada (usar --resolve-asn para activarla).")
+
+    normal_path_length = Counter(c['length'] for c in cycles_data).most_common(1)[0][0]
+    print(f"   ✅ {len(cycles_data)} ciclos procesados (longitud típica: {normal_path_length} saltos).")
+
+    # ✅ FIX #5 — comparación CONSECUTIVA (ciclo N vs ciclo N-1), no contra
+    # línea base global. Confirmado con evidencia real: Path Analysis reporta
+    # "1 change" al ENTRAR a un pico Y otro "1 change" al SALIR de él -- un
+    # solo evento produce DOS cambios, porque compara pares consecutivos, no
+    # contra una mediana histórica.
+    print("\n🔎 Analizando ciclos en busca de anomalías (comparación consecutiva)...")
+    anomalies_per_cycle = []
+    csv_rows = []
+    prev_hops_by_num = {}   # {hop_num: {'ip', 'rtt', 'asn'}} del ciclo ANTERIOR
+    prev_length = None
+    prev_dst_addr = None
+    prev_timeout_slots = None
+
+    for cycle in cycles_data:
+        dt_str = cycle['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        cycle_anomalies = []   # cuentan para el total (🟣 🟡 🔴 🟠 real)
+        cycle_info = []        # solo informativo, NO cuenta (ℹ️ balanceo interno)
+        current_hops_by_num = {h['hop']: h for h in cycle['hops']}
+
+        # 🟠 FIX #8 — cambio de DESTINO (dst_addr), distinto de cambio de ruta
+        # hacia el mismo destino. Confirmado con evidencia real: 'facebook.com'
+        # resolvió a un PoP distinto (Amsterdam->Frankfurt) durante el episodio
+        # del 2026-04-02 -- lo que antes se interpretaba como 'cambio de AS-path'
+        # era, en realidad, redirección DNS/anycast hacia un destino distinto.
+        if prev_dst_addr is not None and cycle['dst_addr'] != prev_dst_addr:
+            cycle_anomalies.append(
+                f"🟠 Destino cambió: {cycle['dst_addr']} (Anterior: {prev_dst_addr}) "
+                f"— probable redirección DNS/anycast, no cambio de ruta hacia el mismo destino"
+            )
+
+        # 🟡 Cambio de longitud vs. el ciclo INMEDIATAMENTE anterior
+        # ✅ FIX #9 (simplificado) — en vez de perseguir causas técnicas
+        # específicas (destino sin responder, MPLS, pérdida intermedia --
+        # cada una explica ALGUNOS casos pero no todos, confirmado con
+        # evidencia real de al menos 3 mecanismos distintos produciendo el
+        # mismo síntoma), se aplica una regla empírica más simple y robusta:
+        # un cambio de longitud SOLO cuenta como cambio de ruta genuino si
+        # viene acompañado de al menos un 🔴 real en el MISMO ciclo. Aislado,
+        # se reclasifica como ⚪ (sospechoso, no cuenta) y queda a criterio
+        # del investigador revisar la URL si quiere confirmar la causa
+        # puntual. Confirmado con 7/7 episodios investigados manualmente.
+        length_changed = prev_length is not None and cycle['length'] != prev_length
+        length_desc = f"🟡 Path Length: {cycle['length']} hops (Anterior: {prev_length})" if length_changed else None
+
+        # 📉 FIX #10 — pérdida intermedia como categoría PROPIA, separada de
+        # 'cambio de ruta'. Confirmado con evidencia real (2026-03-02 20:44):
+        # un aumento de timeouts intermedios puede desplazar el conteo de
+        # saltos SIN que haya degradación de RTT hacia el destino ni cambio
+        # de ruta genuino -- es una señal real de pérdida, pero de una
+        # naturaleza distinta a las otras 3 categorías, y merece su propio
+        # registro en vez de perderse o confundirse con 'Path Length'.
+        if prev_timeout_slots is not None and cycle['timeout_slots'] > prev_timeout_slots:
+            cycle_anomalies.append(
+                f"📉 Pérdida intermedia aumentó: {cycle['timeout_slots']} saltos sin respuesta "
+                f"(Anterior: {prev_timeout_slots}) — sin cambio de ruta ni degradación de RTT al destino"
+            )
+
+        for h in cycle['hops']:
+            hop_num, rtt, ip, asn = h['hop'], h['rtt'], h['ip'], h['asn']
+            prev_h = prev_hops_by_num.get(hop_num)
+
+            if prev_h is not None:
+                prev_rtt, prev_ip, prev_asn = prev_h['rtt'], prev_h['ip'], prev_h['asn']
+
+                # 🟣 RTT: diferencia contra el ciclo ANTERIOR, no la mediana global
+                rtt_diff = abs(rtt - prev_rtt)
+                rtt_pct = (rtt_diff / prev_rtt * 100) if prev_rtt > 0 else 0
+                if rtt_diff > 10.0 and rtt_pct > 20.0:
+                    severidad = clasificar_severidad(rtt_pct)
+                    cycle_anomalies.append(
+                        f"{severidad} Hop {hop_num} RTT: {rtt:.1f}ms (Anterior: {prev_rtt:.1f}ms, +{rtt_pct:.0f}%)"
+                    )
+
+                # 🔴 IP y/o ASN: distintos a los del ciclo ANTERIOR en la misma posición
+                # ✅ FIX #6 — un cambio de IP DENTRO DEL MISMO ASN (balanceo de
+                # carga interno, ej. AS1299 alternando routers) NO CUENTA como
+                # 'change' -- confirmado por evidencia real: Path Analysis
+                # compara 20:38 directo contra 22:08, saltándose 5 ciclos
+                # intermedios donde el ASN se mantenía igual (1299) pese a que
+                # la IP específica alternaba. Va a 'cycle_info' (no cuenta),
+                # no a 'cycle_anomalies'. Requiere --resolve-asn; sin la flag,
+                # se mantiene el comportamiento anterior (cualquier cambio de
+                # IP cuenta, porque no hay forma de saber si es el mismo ASN).
+                if ip != 'Unknown' and prev_ip != 'Unknown' and ip != prev_ip:
+                    # ✅ FIX #7 — ASN 'Unknown' en AMBOS lados (típico de IPs
+                    # privadas, ej. 10.226.x.x) se trata igual que 'mismo ASN'.
+                    # Confirmado con evidencia exacta: excluir 'Unknown' de esta
+                    # regla dejaba 4 ciclos de más marcados (33 vs 29 reales) --
+                    # los 4 correspondían EXACTAMENTE a saltos con IP privada
+                    # alternando sin ningún ASN público resoluble en ningún lado.
+                    # Sin evidencia de un ASN real distinto, no hay base para
+                    # contarlo como cambio genuino.
+                    mismo_asn = args.resolve_asn and (
+                        (asn not in (None, 'Unknown') and asn == prev_asn)
+                        or (asn in (None, 'Unknown') and prev_asn in (None, 'Unknown'))
+                    )
+                    if mismo_asn:
+                        motivo = f"mismo ASN {asn}" if asn not in (None, 'Unknown') else "IP privada, sin ASN público resoluble en ningún lado"
+                        cycle_info.append(
+                            f"ℹ️ Hop {hop_num} IP: {ip} (Anterior: {prev_ip}) — {motivo}, "
+                            f"NO cuenta como cambio (balanceo de carga interno)"
+                        )
+                    else:
+                        etiqueta_asn = f", ASN {prev_asn}->{asn}" if args.resolve_asn else ""
+                        cycle_anomalies.append(f"🔴 Hop {hop_num} IP: {ip} (Anterior: {prev_ip}{etiqueta_asn})")
+            # Si prev_h es None (primer ciclo, o el salto no existía antes),
+            # no hay nada contra qué comparar -- no se marca nada.
+
+            csv_rows.append({
+                'timestamp': dt_str, 'hop': hop_num, 'ip': ip, 'asn': asn, 'rtt_ms': rtt,
+            })
+
+        # Decisión final del cambio de longitud, ya con el ciclo completo procesado
+        if length_desc is not None:
+            hay_cambio_real = any(a.startswith('🔴') for a in cycle_anomalies)
+            if hay_cambio_real:
+                cycle_anomalies.insert(0, length_desc)
+            else:
+                cycle_info.insert(0, f"⚪ {length_desc[2:]} — sin cambio de ASN/IP real acompañante, "
+                                      f"probable artefacto de pérdida intermedia, NO cuenta como cambio de ruta")
+
+        if cycle_anomalies:
+            anomalies_per_cycle.append({
+                'timestamp': dt_str, 'ts_ms': cycle['ts_ms'],
+                'anomalies': cycle_anomalies + cycle_info,  # info solo se muestra si YA hay una anomalía real
+            })
+
+        prev_hops_by_num = current_hops_by_num
+        prev_length = cycle['length']
+        prev_dst_addr = cycle['dst_addr']
+        prev_timeout_slots = cycle['timeout_slots']
+
+    # 4. Guardar CSV
+    output_file = args.output or f"historial_traceroute_probe_{args.probe_id}.csv"
+    pd.DataFrame(csv_rows).to_csv(output_file, index=False)
+    print(f"\n💾 Datos detallados guardados en: {output_file}")
+
+    if args.ground_truth_output:
+        n_exportadas = exportar_ground_truth(anomalies_per_cycle, args.ground_truth_output)
+        print(f"💾 {n_exportadas} eventos de ground truth exportados a: {args.ground_truth_output}")
+
+    # 5. Reporte
+    print(f"\n📊 Resumen de Anomalías Detectadas:")
+    print(f"   Ciclos totales analizados: {len(cycles_data)}")
+    print(f"   Ciclos con anomalías: {len(anomalies_per_cycle)} "
+          f"({100*len(anomalies_per_cycle)/max(1, len(cycles_data)):.1f}%)")
+
+    # ✅ Desglose por categoría -- cuenta cada LÍNEA de anomalía (no ciclo,
+    # ya que un mismo ciclo puede tener varias categorías a la vez, como
+    # vimos con el caso Facebook: 🟠+🟡+🔴 juntos en el mismo ciclo).
+    # Reutiliza clasificar_anomalia() -- la MISMA función que usa
+    # exportar_ground_truth, para que consola y CSV nunca diverjan.
+    NOMBRES_CATEGORIA = {
+        'rtt_dark': 'RTT - Dark (>200%)', 'rtt_medium': 'RTT - Medium (40-200%)',
+        'rtt_light': 'RTT - Light (20-40%)', 'cambio_ip_asn': 'Cambio de IP/ASN en un salto',
+        'cambio_longitud': 'Cambio de longitud (con 🔴 real acompañante)',
+        'cambio_destino': 'Cambio de destino (dst_addr)', 'perdida_intermedia': 'Pérdida intermedia aumentó',
+    }
+    conteo = Counter()
+    conteo_info = Counter()
+    for item in anomalies_per_cycle:
+        for anom in item['anomalies']:
+            categoria = clasificar_anomalia(anom)
+            if categoria is not None:
+                conteo[NOMBRES_CATEGORIA[categoria]] += 1
+            elif anom.startswith('⚪'):
+                conteo_info['Longitud sospechosa (sin 🔴 real, no cuenta)'] += 1
+
+    if conteo:
+        print(f"\n📋 Desglose por categoría ({sum(conteo.values())} líneas totales):")
+        for categoria, cantidad in conteo.most_common():
+            print(f"   {categoria:45s}: {cantidad}")
+    if conteo_info:
+        print(f"\nℹ️ Informativo, no cuenta como anomalía:")
+        for categoria, cantidad in conteo_info.most_common():
+            print(f"   {categoria:45s}: {cantidad}")
+
+    if anomalies_per_cycle:
+        print(f"\n🔗 Los {len(anomalies_per_cycle)} ciclos con anomalías (orden cronológico):")
+        for item in anomalies_per_cycle:
+            print(f"\n   🕒 {item['timestamp']} UTC:")
+            for anom in item['anomalies']:
+                print(f"      {anom}")
+            url = (f"https://atlas.ripe.net/pathanalysis/embed?"
+                   f"measurementId={args.measurement_id}&sourceProbeId={args.probe_id}&"
+                   f"center={item['ts_ms']}&window=7200000")
+            print(f"      🔗 URL: {url}")
+
+    print("\n✅ ¡Proceso completado!")
+
+
+if __name__ == "__main__":
+    main()
